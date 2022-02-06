@@ -22,6 +22,15 @@ type ExampleReply struct {
 	Y int
 }
 
+type Reply struct {
+	taskUndo Task
+	Y int
+}
+
+type Args struct {
+	taskCompleted Task
+}
+
 // Add your RPC definitions here.
 
 
