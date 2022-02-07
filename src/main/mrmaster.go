@@ -24,6 +24,6 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-
+	fmt.Println("master退出")
 	time.Sleep(time.Second)
 }
