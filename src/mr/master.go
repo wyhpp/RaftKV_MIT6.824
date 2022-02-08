@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -58,6 +59,8 @@ type Task struct {
 	nReduce int
 	//中间文件位置
 	intermediateFiles[] string
+	//开始时间
+	starttime time.Time
 }
 // Your code here -- RPC handlers for the worker to call.
 
@@ -86,6 +89,7 @@ func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 				fmt.Printf("assign map task %v\n",task.taskNumber)
 				//把任务状态改位正在处理中
 				m.tasksMap[i].status = InProgress
+				m.tasksMap[i].starttime = time.Now()
 				flag = false
 				break
 			}
@@ -109,6 +113,7 @@ func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 				fmt.Printf("assign reduce task %v\n",task.taskNumber)
 				//把任务状态改位正在处理中
 				m.tasksMap[i].status = InProgress
+				m.tasksMap[i].starttime = time.Now()
 				flag = false
 				break
 			}
@@ -153,6 +158,12 @@ func (m *Master) CompletionHandler(args *Args, reply *Reply) error {
 		intermediateFiles: args.IntermediateFile,
 		typeName: args.Typename,
 	}
+
+	lock.Lock()
+	//抛弃过期返回的任务
+	if m.tasksMap[completedTask.taskNumber].status != InProgress || completedTask.typeName != m.MasterPhase {
+		return nil
+	}
 	if completedTask.typeName == Map {
 		m.intermediateFile = append(m.intermediateFile, completedTask.intermediateFiles)
 	}
@@ -160,7 +171,6 @@ func (m *Master) CompletionHandler(args *Args, reply *Reply) error {
 		m.tasksMap[completedTask.taskNumber].status = Completed
 
 		//遍历taskmap，查看是否全部完成
-		lock.Lock()
 		flag := true
 		for _,task := range m.tasksMap {
 			if task.status != Completed {
@@ -259,21 +269,19 @@ func MakeMaster(files []string, nReduce int) *Master {
 		m.tasksMap[i] = &m.taskWaitingQ[i]
 	}
 
-	//读取文件内容，切分任务
-	//for i, filename := range m.fileNames {
-	//	file, err := os.Open(filename)
-	//	if err != nil {
-	//		log.Fatalf("cannot open %v", filename)
-	//	}
-	//	content, err := ioutil.ReadAll(file)
-	//	if err != nil {
-	//		log.Fatalf("cannot read %v", filename)
-	//	}
-	//	file.Close()
-	//	//把切分的文件内容放入task中
-	//	m.tasksMap[i].content = content
-	//}
-
 	m.server()
+	for true {
+		//遍历检查是否有task过期
+		for i,task := range m.tasksMap {
+			//处理中的任务超过10秒没完成，将任务状态重置
+			if task.status == InProgress && time.Now().Sub(task.starttime)>=10*time.Second {
+				m.tasksMap[i].status = Idle
+			}
+		}
+		//master退出
+		if m.MasterPhase == Exit {
+			break
+		}
+	}
 	return &m
 }
