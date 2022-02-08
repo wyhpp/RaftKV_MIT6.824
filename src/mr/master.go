@@ -2,7 +2,6 @@ package mr
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"sync"
 )
@@ -52,7 +51,7 @@ type Task struct {
 	//任务状态
 	status TaskStatus
 	//任务内容
-	content[] byte
+	content string
 	//任务编号
 	taskNumber int
 	//切分数量
@@ -77,59 +76,69 @@ func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 	flag := true
 	if m.MasterPhase == Map {
 		lock.Lock()
-		for _,task := range m.tasksMap {
+		for i,task := range m.tasksMap {
 			//如果有任务状态为idle的任务存在
-			if task.status == TaskStatus(0){
-				reply.taskUndo = *task
+			if task.status == Idle{
+				reply.Tasknumber = task.taskNumber
+				reply.Content = task.content
+				reply.Tasktype = task.typeName
+				reply.Reduce = task.nReduce
 				fmt.Printf("assign map task %v\n",task.taskNumber)
 				//把任务状态改位正在处理中
-				task.status = TaskStatus(1)
+				m.tasksMap[i].status = InProgress
 				flag = false
 				break
 			}
+		}
+		if flag {
+			reply.Y = wait
 		}
 		lock.Unlock()
 	}else if m.MasterPhase == Reduce{
 		//分配reduce任务
 		//返回任务以及中间文件位置
 		lock.Lock()
-		for _,task := range m.tasksMap {
+		for i,task := range m.tasksMap {
 			//如果有任务状态为idle的任务存在
-			if task.status == TaskStatus(0){
-				reply.taskUndo = *task
+			if task.status == Idle{
+				reply.Tasknumber = task.taskNumber
+				reply.Content = task.content
+				reply.Tasktype = task.typeName
+				reply.Reduce = task.nReduce
+				reply.IntermediateFile = task.intermediateFiles
 				fmt.Printf("assign reduce task %v\n",task.taskNumber)
 				//把任务状态改位正在处理中
-				task.status = TaskStatus(1)
+				m.tasksMap[i].status = InProgress
 				flag = false
 				break
 			}
 		}
 		if flag {
 			//没有任务,可以退出
-			reply.Y = -1
+			reply.Y = exit
 		}
 		lock.Unlock()
 	}
 
 	//map任务已经处理完成，进入reduce阶段
-	lock.Lock()
-	if flag && m.MasterPhase == Map {
-		m.MasterPhase = Reduce
-		//将任务全部改成reduce任务，状态改为未完成
-		//最好重新生成nReduce个task任务
-		//清空map
-		m.tasksMap = make(map[int]*Task)
-		for i := 0; i < m.reduce; i++ {
-			task := Task{}
-			task.typeName = TaskType(1)
-			task.status = TaskStatus(0)
-			task.intermediateFiles =m.intermediateFile[task.taskNumber]
-			task.taskNumber = i
-			//存入map
-			m.tasksMap[i] = &task
-		}
-	}
-	lock.Unlock()
+	//lock.Lock()
+	//if flag && m.MasterPhase == Map {
+	//	m.MasterPhase = Reduce
+	//	//将任务全部改成reduce任务，状态改为未完成
+	//	//最好重新生成nReduce个task任务
+	//	//清空map
+	//	m.tasksMap = make(map[int]*Task)
+	//	for i := 0; i < m.reduce; i++ {
+	//		task := Task{}
+	//		task.typeName = TaskType(1)
+	//		task.status = TaskStatus(0)
+	//		task.intermediateFiles =m.intermediateFile[task.taskNumber]
+	//		task.taskNumber = i
+	//		//存入map
+	//		m.tasksMap[i] = &task
+	//	}
+	//}
+	//lock.Unlock()
 	//通过返回值告诉worker线程没有任务时可以退出
 
 	return nil
@@ -139,30 +148,50 @@ func (m *Master) CompletionHandler(args *Args, reply *Reply) error {
 	//如果是map任务完成
 	//将中间文件位置加入master中，标记任务完成
 	//遍历所有任务查看是否全部完成，若是，开始分配reduce任务
-	completedTask := args.taskCompleted
+	completedTask := Task{
+		taskNumber: args.Tasknumber,
+		intermediateFiles: args.IntermediateFile,
+		typeName: args.Typename,
+	}
 	if completedTask.typeName == Map {
-		m.intermediateFile = append(m.intermediateFile,completedTask.intermediateFiles)
+		m.intermediateFile = append(m.intermediateFile, completedTask.intermediateFiles)
+	}
 		//标记任务完成
-		masterTask := m.tasksMap[completedTask.taskNumber]
-		masterTask.status = TaskStatus(2)
-	}else {
-		masterTask := m.tasksMap[completedTask.taskNumber]
-		masterTask.status = TaskStatus(2)
+		m.tasksMap[completedTask.taskNumber].status = Completed
+
 		//遍历taskmap，查看是否全部完成
+		lock.Lock()
 		flag := true
 		for _,task := range m.tasksMap {
-			if task.status != TaskStatus(2) {
+			if task.status != Completed {
 				flag = false
 				break
 			}
 		}
-		if flag {
+		if flag && m.MasterPhase == Reduce{
 			//将master阶段设为exit
 			m.MasterPhase = Exit
+		}else if flag && m.MasterPhase == Map {
+			m.MasterPhase = Reduce
+			//将任务全部改成reduce任务，状态改为未完成
+			//最好重新生成nReduce个task任务
+			//清空map
+			m.tasksMap = make(map[int]*Task)
+			for i := 0; i < m.reduce; i++ {
+				task := Task{}
+				task.typeName = TaskType(1)
+				task.status = TaskStatus(0)
+				task.taskNumber = i
+				for j := range m.intermediateFile {
+					task.intermediateFiles = append(task.intermediateFiles,m.intermediateFile[j][i])
+				}
+				//task.intermediateFiles =m.intermediateFile[i]
+				//存入map
+				m.tasksMap[i] = &task
+			}
 		}
-	}
-
-	reply.Y = args.taskCompleted.taskNumber
+		lock.Unlock()
+	//reply.Y = args.Tasknumber
 	return nil
 }
 
@@ -207,7 +236,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		fileNames: files,
 		tasksMap: make(map[int]*Task),
 		taskWaitingQ: make([]Task,len(files)),
-		intermediateFile: make([][]string,nReduce),
+		intermediateFile: make([][]string,0),
 		MasterPhase: Map,
 	}
 	// Your code here.
@@ -217,29 +246,33 @@ func MakeMaster(files []string, nReduce int) *Master {
 
 	//初始化等待任务数组
 	//生成了文件数量个任务数组，初始化任务状态
-	for i,task := range m.taskWaitingQ {
+	//遍历得到的值应该只是原值的拷贝，对其修改不会改变原来的值
+	for i := range m.fileNames {
+		task := m.taskWaitingQ[i]
 		task.status = Idle
 		task.typeName = Map
 		task.taskNumber = i
 		task.nReduce = nReduce
+		task.content = m.fileNames[i]
+		m.taskWaitingQ[i] = task
 		//加入所有任务信息map
-		m.tasksMap[i] = &task
+		m.tasksMap[i] = &m.taskWaitingQ[i]
 	}
 
 	//读取文件内容，切分任务
-	for i, filename := range m.fileNames {
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", filename)
-		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", filename)
-		}
-		file.Close()
-		//把切分的文件内容放入task中
-		m.tasksMap[i].content = content
-	}
+	//for i, filename := range m.fileNames {
+	//	file, err := os.Open(filename)
+	//	if err != nil {
+	//		log.Fatalf("cannot open %v", filename)
+	//	}
+	//	content, err := ioutil.ReadAll(file)
+	//	if err != nil {
+	//		log.Fatalf("cannot read %v", filename)
+	//	}
+	//	file.Close()
+	//	//把切分的文件内容放入task中
+	//	m.tasksMap[i].content = content
+	//}
 
 	m.server()
 	return &m

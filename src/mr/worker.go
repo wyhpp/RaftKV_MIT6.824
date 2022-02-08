@@ -3,9 +3,11 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"sort"
 	"strconv"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -45,12 +47,16 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	// uncomment to send the Example RPC to the master.
-	var task Task
 	//循环获取任务
 	for true {
-		task = GetTask()
-		if task.status == TaskStatus(2) {
+		task,Order := GetTask()
+		if Order == wait {
+			time.Sleep(time.Second)
+			continue
+		}
+		if Order == exit{
 			//已经没有任务，退出
+			fmt.Println("worker退出")
 			break
 		}
 		if task.typeName ==TaskType(0){
@@ -61,15 +67,26 @@ func Worker(mapf func(string, string) []KeyValue,
 		//任务完成
 		TaskComplete(&task)
 	}
-	fmt.Println("worker 退出")
+	//fmt.Println("worker 退出")
 }
 
 //map任务处理
 func MapProcess(task *Task,mapf func(string, string) []KeyValue)  {
 	task.status = TaskStatus(1)
-	filename := ""
+	filename := task.content
 	intermediate := []KeyValue{}
-	kva := mapf(filename, string(task.content))
+	//读取文件内容
+	file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open map %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read map %v", filename)
+		}
+		file.Close()
+
+	kva := mapf(filename, string(content))
 	intermediate = append(intermediate, kva...)
 	//输出intermediate到文件
 	//将文件切分成r份
@@ -110,19 +127,22 @@ func ReduceProcess(task *Task,reducef func(string, []string) string)  {
 	//按key值排序然后计数
 	//读取文件内容
 	intermediateContents := []KeyValue{}
+	//fmt.Println("中间文件",task.intermediateFiles)
 	for i := range task.intermediateFiles {
-		intermediateContents = append(intermediateContents,ReadFile(task.intermediateFiles[i])...)
+		kv := ReadFile(task.intermediateFiles[i])
+		intermediateContents = append(intermediateContents,kv...)
 	}
 	//按key排序
 	sort.Sort(ByKey(intermediateContents))
 
 	oname := "mr-out-" + strconv.Itoa(task.taskNumber)
-	ofile, _ := os.Create(oname)
+	ofile, _ := ioutil.TempFile("./", "mr-out-tmp*") //先写道tmp文件中
 	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
 	//
 	i := 0
+	//fmt.Println("中间内容",intermediateContents[:10])
 	for i < len(intermediateContents) {
 		j := i + 1
 		for j < len(intermediateContents) && intermediateContents[j].Key == intermediateContents[i].Key {
@@ -141,6 +161,12 @@ func ReduceProcess(task *Task,reducef func(string, []string) string)  {
 	}
 	ofile.Close()
 
+	os.Rename(ofile.Name(), oname) //Reduce操作，完成之后修改名字
+
+	//删除中间文件
+	for _, inputFileName := range task.intermediateFiles {
+		os.Remove(inputFileName)
+	}
 	TaskComplete(task)
 
 }
@@ -148,7 +174,7 @@ func ReduceProcess(task *Task,reducef func(string, []string) string)  {
 func ReadFile(filename string) []KeyValue {
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		log.Fatalf("cannot open reduce %v", filename)
 	}
 	dec := json.NewDecoder(file)
 	kva := []KeyValue{}
@@ -160,6 +186,7 @@ func ReadFile(filename string) []KeyValue {
 		kva = append(kva, kv)
 	}
 	file.Close()
+	//fmt.Printf("内容是 %v\n",kva[:5])
 	return kva
 }
 //map或reduce处理完成
@@ -173,7 +200,7 @@ func TaskComplete(task *Task)  {
 // the RPC argument and reply types are defined in rpc.go.
 //
 //向master请求任务
-func GetTask() Task{
+func GetTask() (Task,order){
 
 	// declare an argument structure.
 	args := ExampleArgs{}
@@ -186,20 +213,20 @@ func GetTask() Task{
 
 	// send the RPC request, wait for the reply.
 	call("Master.AssignTask", &args, &reply)
-
-	if reply.Y == -1 {
-		//没有任务，需要退出
-		task := reply.taskUndo
-		task.status = TaskStatus(2)
-		return task
-	}
 	//处理reply中的Task
-	task := reply.taskUndo
+	task := Task{
+		taskNumber: reply.Tasknumber,
+		content: reply.Content,
+		typeName: reply.Tasktype,
+		nReduce: reply.Reduce,
+		intermediateFiles: reply.IntermediateFile,
+	}
+
 
 	// reply.Y should be 100.
-	fmt.Printf("gettask %v\n", reply.taskUndo.taskNumber)
+	//fmt.Printf("gettask %v\n", reply.Tasknumber)
 
-	return task
+	return task,reply.Y
 }
 
 func CallCompleted(task Task){
@@ -209,7 +236,9 @@ func CallCompleted(task Task){
 
 	// fill in the argument(s).
 	task.status = TaskStatus(2)
-	args.taskCompleted = task
+	args.IntermediateFile = task.intermediateFiles
+	args.Tasknumber = task.taskNumber
+	args.Typename = task.typeName
 
 	// declare a reply structure.
 	reply := Reply{}
@@ -220,7 +249,7 @@ func CallCompleted(task Task){
 	//返回task状态
 
 	// reply.Y should be 100.
-	fmt.Printf("task completed,task number is %v\n", reply.Y)
+	//fmt.Printf("task completed,task number is %v\n", reply.Y)
 
 }
 //
