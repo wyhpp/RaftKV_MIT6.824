@@ -59,9 +59,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			fmt.Println("worker退出")
 			break
 		}
-		if task.typeName ==TaskType(0){
+		if task.typeName == Map{
 			MapProcess(&task,mapf)
-		}else if task.typeName == TaskType(1) {
+		}else if task.typeName == Reduce {
 			ReduceProcess(&task,reducef)
 		}
 		//任务完成
@@ -167,7 +167,6 @@ func ReduceProcess(task *Task,reducef func(string, []string) string)  {
 	for _, inputFileName := range task.intermediateFiles {
 		os.Remove(inputFileName)
 	}
-	TaskComplete(task)
 
 }
 
