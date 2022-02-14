@@ -275,7 +275,9 @@ func MakeMaster(files []string, nReduce int) *Master {
 		for i,task := range m.tasksMap {
 			//处理中的任务超过10秒没完成，将任务状态重置
 			if task.status == InProgress && time.Now().Sub(task.starttime)>=10*time.Second {
+				lock.Lock()
 				m.tasksMap[i].status = Idle
+				lock.Unlock()
 			}
 		}
 		//master退出
