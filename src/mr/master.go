@@ -40,8 +40,6 @@ type Master struct {
 	intermediateFile[][] string
 	//所有任务信息
 	tasksMap map[int]*Task
-	//等待执行任务数组
-	taskWaitingQ[] Task
 	//任务阶段
 	MasterPhase TaskType
 }
@@ -77,8 +75,8 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 	//遍历taskmap，查看是否还有未完成的maptask
 	flag := true
+	lock.Lock()
 	if m.MasterPhase == Map {
-		lock.Lock()
 		for i,task := range m.tasksMap {
 			//如果有任务状态为idle的任务存在
 			if task.status == Idle{
@@ -97,11 +95,9 @@ func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 		if flag {
 			reply.Y = wait
 		}
-		lock.Unlock()
 	}else if m.MasterPhase == Reduce{
 		//分配reduce任务
 		//返回任务以及中间文件位置
-		lock.Lock()
 		for i,task := range m.tasksMap {
 			//如果有任务状态为idle的任务存在
 			if task.status == Idle{
@@ -122,9 +118,8 @@ func (m *Master) AssignTask(args *ExampleArgs, reply *Reply) error {
 			//没有任务,可以退出
 			reply.Y = exit
 		}
-		lock.Unlock()
 	}
-
+	lock.Unlock()
 	//map任务已经处理完成，进入reduce阶段
 	//lock.Lock()
 	//if flag && m.MasterPhase == Map {
@@ -161,7 +156,9 @@ func (m *Master) CompletionHandler(args *Args, reply *Reply) error {
 
 	lock.Lock()
 	//抛弃过期返回的任务
-	if m.tasksMap[completedTask.taskNumber].status != InProgress || completedTask.typeName != m.MasterPhase {
+	if	m.tasksMap[completedTask.taskNumber].status != InProgress || completedTask.typeName != m.MasterPhase {
+		println("任务过期,完成状态",m.tasksMap[completedTask.taskNumber].status)
+		lock.Unlock()
 		return nil
 	}
 	if completedTask.typeName == Map {
@@ -189,8 +186,8 @@ func (m *Master) CompletionHandler(args *Args, reply *Reply) error {
 			m.tasksMap = make(map[int]*Task)
 			for i := 0; i < m.reduce; i++ {
 				task := Task{}
-				task.typeName = TaskType(1)
-				task.status = TaskStatus(0)
+				task.typeName = Reduce
+				task.status = Idle
 				task.taskNumber = i
 				for j := range m.intermediateFile {
 					task.intermediateFiles = append(task.intermediateFiles,m.intermediateFile[j][i])
@@ -235,6 +232,28 @@ func (m *Master) Done() bool {
 	return ret
 }
 
+func (m *Master)CheckTimeOut()  {
+	for {
+		time.Sleep(5*time.Second)
+		//遍历检查是否有task过期
+		fmt.Println("检测超时")
+		//master退出
+		if m.MasterPhase == Exit {
+			return
+		}
+		lock.Lock()
+		for i,task := range m.tasksMap {
+			//处理中的任务超过10秒没完成，将任务状态重置
+			if task.status == InProgress && time.Now().Sub(task.starttime)>=10*time.Second {
+				m.tasksMap[i].status = Idle
+				fmt.Println("任务",i,"过期")
+			}
+		}
+		lock.Unlock()
+
+	}
+}
+
 //
 // create a Master.
 // main/mrmaster.go calls this function.
@@ -245,7 +264,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		reduce: nReduce,
 		fileNames: files,
 		tasksMap: make(map[int]*Task),
-		taskWaitingQ: make([]Task,len(files)),
+		//taskWaitingQ: make([]Task,len(files)),
 		intermediateFile: make([][]string,0),
 		MasterPhase: Map,
 	}
@@ -257,33 +276,21 @@ func MakeMaster(files []string, nReduce int) *Master {
 	//初始化等待任务数组
 	//生成了文件数量个任务数组，初始化任务状态
 	//遍历得到的值应该只是原值的拷贝，对其修改不会改变原来的值
-	for i := range m.fileNames {
-		task := m.taskWaitingQ[i]
+	for i := 0; i < len(files); i++ {
+		task := Task{}
 		task.status = Idle
 		task.typeName = Map
 		task.taskNumber = i
 		task.nReduce = nReduce
 		task.content = m.fileNames[i]
-		m.taskWaitingQ[i] = task
+		//m.taskWaitingQ[i] = task
 		//加入所有任务信息map
-		m.tasksMap[i] = &m.taskWaitingQ[i]
+		m.tasksMap[i] = &task
 	}
 
 	m.server()
-	for true {
-		//遍历检查是否有task过期
-		for i,task := range m.tasksMap {
-			//处理中的任务超过10秒没完成，将任务状态重置
-			if task.status == InProgress && time.Now().Sub(task.starttime)>=10*time.Second {
-				lock.Lock()
-				m.tasksMap[i].status = Idle
-				lock.Unlock()
-			}
-		}
-		//master退出
-		if m.MasterPhase == Exit {
-			break
-		}
-	}
+
+	go m.CheckTimeOut()
+
 	return &m
 }
