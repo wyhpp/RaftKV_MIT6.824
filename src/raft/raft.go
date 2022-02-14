@@ -50,7 +50,7 @@ const (
 )
 
 //心跳超时时间
-const HEARTBEAT_TIMEOUT = 100
+const HEARTBEAT_TIMEOUT = 500
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -174,17 +174,18 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//判断自己当前term是否投过票
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term == rf.term && rf.voteFor != -1 {
 		reply.VoteGuarantee = false
-	}
-	if args.Term < rf.term {
+	}else if args.Term < rf.term {
 		reply.VoteGuarantee = false
 	}else {
 		//包含选举term大于自己的term和选举term等于自己的term但自己没投过票两种
 		rf.term = args.Term
 		reply.VoteGuarantee = true
 		rf.voteFor = args.CandidateId
-		DPrintf("%d 投票给 %d , term is %d",rf.me,rf.voteFor,rf.term)
+		DPrintf("%d 投票给 %d , term is %d",rf.me,rf.voteFor,args.Term)
 	}
 }
 
@@ -255,6 +256,7 @@ func (rf *Raft) replyHeartBeat(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 //开启选举流程
 func (rf *Raft) startElection() bool{
+	DPrintf("server %d start election,term is %d",rf.me,rf.term)
 	//1.将自己变成candidate
 	rf.serverState = Candidate
 	rf.electionTimeout = 150 + rand.Intn(150) //150-300ms
@@ -266,47 +268,53 @@ func (rf *Raft) startElection() bool{
 	startTime :=time.Now()
 	//3.并发给其他服务器发送投票请求
 	//var wg sync.WaitGroup
-	var mu sync.Mutex
-	var cn chan int
+	cn := make(chan int)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 		go func(x int) {
 			args := RequestVoteArgs{
-				CandidateId: x,
+				CandidateId: rf.me,
 				Term: rf.term,
 			}
 			reply := RequestVoteReply{}
+			DPrintf("%d send vote  request to %d",rf.me,x)
 			getReply := rf.sendRequestVote(x,&args,&reply)
+			DPrintf("%d get reply vote is %v",rf.me,reply.VoteGuarantee)
 			if getReply {
-				mu.Lock()
-				defer mu.Unlock()
+				rf.mu.Lock()
 				if reply.VoteGuarantee {
 					count++
 				}
+				rf.mu.Unlock()
 			}
 			cn<- 1
 		}(i)
 	}
 	//4.接收投票并统计
+
 	for true {
-		//如果收到半数以上的票数，当选为leader
-		<-cn
-		mu.Lock()
-		defer mu.Unlock()
-		if count > len(rf.peers)/2 {
-			DPrintf("leader is %d , term is %d",rf.me,rf.term)
-			rf.serverState = Leader
-			break
-		}
 		//如果选举超时，则再次发起选举
 		if time.Now().Sub(startTime) > time.Duration(rf.electionTimeout)*time.Millisecond {
 			DPrintf("选举超时 term is %d",rf.term)
-			return false
+			rf.startElection()
+			break
 		}
+		//如果收到半数以上的票数，当选为leader
+		<-cn
+		//DPrintf("channel 数据 %d ",data)
+		rf.mu.Lock()
+		if count > len(rf.peers)/2 {
+			DPrintf("leader is %d , term is %d",rf.me,rf.term)
+			rf.serverState = Leader
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
 		//如果收到leader的心跳验证，自己落选
 		if rf.serverState == Follower {
+			DPrintf("%d 收到心跳",rf.me)
 			break
 		}
 	}
@@ -317,7 +325,6 @@ func (rf *Raft) startElection() bool{
 //周期发送心跳验证
 func (rf *Raft) sendHB(){
 	for rf.serverState == Leader {
-		time.Sleep(100*time.Millisecond)
 		//同时发送心跳验证
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -332,6 +339,7 @@ func (rf *Raft) sendHB(){
 				rf.sendHeartBeat(x, &args, &reply)
 			}(i)
 		}
+		time.Sleep(200*time.Millisecond)
 	}
 }
 
@@ -341,6 +349,7 @@ func (rf *Raft) testHB(){
 	for {
 		if rf.serverState != Leader {
 			if time.Now().Sub(rf.heartbeatTime) > HEARTBEAT_TIMEOUT*time.Millisecond {
+				DPrintf("心跳超时")
 				rf.startElection()
 			}
 		}
@@ -422,12 +431,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	//初始化完成开始选举流程
 	//开一个线程发送投票，同时开一个线程接收投票
-	for  {
-		DPrintf("server %d start election ",rf.me)
-		if rf.startElection() {
-			break
-		}
-	}
+
+	go rf.startElection()
+
 
 	//如果当选leader，周期发送心跳验证
 	go rf.sendHB()
