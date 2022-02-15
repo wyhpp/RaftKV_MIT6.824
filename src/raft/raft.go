@@ -88,6 +88,19 @@ type Raft struct {
 	electionTimeout  int   //选举超时时间
 	voteFor          int
 	heartbeatTime     time.Time
+
+	//2B
+	logs			[]LogEntry
+	commitIndex     int
+	lastApplied     int
+	nextIndex       []int
+	matchIndex      []int
+}
+
+//logentry结构
+type LogEntry struct {
+	term 			int
+	command         interface{}
 }
 
 // return currentTerm and whether this server
@@ -169,7 +182,7 @@ type RequestVoteReply struct {
 }
 
 //心跳rpc参数
-type SendHBArgs struct {
+type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
 	Term int
 	CandidateId   int
@@ -179,7 +192,7 @@ type SendHBArgs struct {
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
-type SendHBReply struct {
+type AppendEntriesReply struct {
 	// Your data here (2A).
 	Term          int
 	VoteGuarantee bool
@@ -248,8 +261,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendHeartBeat(server int, args *SendHBArgs, reply *SendHBReply) bool {
-	ok := rf.peers[server].Call("Raft.HeartBeat", args, reply)
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if ok {
 		if reply.Term > rf.term {
 			//重新发起选举
@@ -258,7 +271,7 @@ func (rf *Raft) sendHeartBeat(server int, args *SendHBArgs, reply *SendHBReply) 
 	return ok
 }
 
-func (rf *Raft) HeartBeat(args *SendHBArgs, reply *SendHBReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//重置hearbeattime
 	rf.heartbeatTime = time.Now()
 	//返回自己的term
@@ -342,12 +355,12 @@ func (rf *Raft) sendHB(){
 				continue
 			}
 			go func(x int) {
-				args := SendHBArgs{
+				args := AppendEntriesArgs{
 					CandidateId: x,
 					Term:        rf.term,
 				}
-				reply := SendHBReply{}
-				rf.sendHeartBeat(x, &args, &reply)
+				reply := AppendEntriesReply{}
+				rf.sendAppendEntries(x, &args, &reply)
 			}(i)
 		}
 		time.Sleep(200*time.Millisecond)
@@ -400,12 +413,21 @@ func (rf *Raft)testElectionTimeout(startTime time.Time){
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	//模拟客户端给服务器发送命令
+	//leader接到命令后，进行操作，同步日志，发送给follower
+	//follower接到命令返回false
 	index := -1
-	term := -1
-	isLeader := true
+	term := rf.term
+	var isLeader bool
+	if rf.serverState == Leader {
+		isLeader = true
+	}else {
+		isLeader = false
+		return index, term, isLeader
+	}
 
 	// Your code here (2B).
-
+	//如果是leader
 
 	return index, term, isLeader
 }
