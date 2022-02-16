@@ -99,8 +99,8 @@ type Raft struct {
 
 //logentry结构
 type LogEntry struct {
-	term 			int
-	command         interface{}
+	Term 			int
+	Command         interface{}
 }
 
 // return currentTerm and whether this server
@@ -217,7 +217,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}else if args.Term < rf.term {
 		reply.VoteGuarantee = false
 	}else if len(rf.logs) > 0{
-		if args.EntryTerm < rf.logs[len(rf.logs)-1].term || args.EntryIndex < len(rf.logs)-1 {
+		if args.EntryTerm < rf.logs[len(rf.logs)-1].Term || args.EntryIndex < len(rf.logs)-1 {
 			reply.VoteGuarantee = false
 		}
 	}else {
@@ -291,7 +291,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PreLogIndex < len(rf.logs) {
 		if args.PreLogIndex == -1 {
 			reply.IsSuccess = true
-		}else if rf.logs[args.PreLogIndex].term == args.PreLogTerm{
+		}else if rf.logs[args.PreLogIndex].Term == args.PreLogTerm{
 			reply.IsSuccess = true
 		}else {
 			reply.IsSuccess = false
@@ -302,7 +302,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//添加日志
 	if reply.IsSuccess {
+		DPrintf("%d 收到日志 %v",rf.me,args.Entries)
 		rf.logs = append(rf.logs, args.Entries...)
+		DPrintf("%d 日志是 %v",rf.me,rf.logs)
 	}
 
 	reply.Term = rf.term
@@ -337,7 +339,7 @@ func (rf *Raft) startElection() bool{
 			if len(rf.logs) == 0 {
 				args.EntryTerm = 0
 			}else {
-				args.EntryTerm = rf.logs[len(rf.logs)-1].term
+				args.EntryTerm = rf.logs[len(rf.logs)-1].Term
 			}
 			reply := RequestVoteReply{}
 			DPrintf("%d send vote  request to %d ,term is %d",rf.me,x,rf.term)
@@ -391,67 +393,72 @@ func (rf *Raft) sendHB(){
 	for rf.serverState == Leader {
 		DPrintf("%d 发送心跳验证",rf.me)
 		//同时发送心跳验证
-		count := 0
-		finish := 0
-		cn := make(chan int)
-		mu := sync.Mutex{}
-		//发送日志给所有follower
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			go func(x int) {
-				args := AppendEntriesArgs{
-					Term:        rf.term,
-					PreLogIndex: rf.nextIndex[x]-1,//对应follower日志的nextIndex的前一个index
-					Entries:     make([]LogEntry,0),
-				}
-				//初始没有日志的状态
-				if rf.nextIndex[x] == 0 {
-					args.PreLogTerm = -1
-				}else {
-					args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].term
-					args.Entries = rf.logs[rf.nextIndex[x] : ]//对应服务器下一个index位置的日志到日志末尾
-				}
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(x, &args, &reply)
-				mu.Lock()
-				if ok {
-					if reply.IsSuccess {
-						count++
-					}else {
-						//follower同步失败，回退nextindex
-						rf.nextIndex[x] = rf.nextIndex[x]-1
-					}
-				}
-				finish++
-				mu.Unlock()
-				cn<-1
-			}(i)
-		}
-
-		for true {
-			<-cn
-			mu.Lock()
-			if count > len(rf.peers)/2 {
-				DPrintf("leader %d 日志同步成功",rf.me)
-				//超过半数服务器返回成功，认为成功，commit日志
-				//只commit 最新的logentry
-				rf.commitIndex = len(rf.logs)-1
-				mu.Unlock()
-				break
-			}
-			//所有的server均已回应，无论是否掉线
-			if finish == len(rf.peers)-1 {
-				DPrintf("leader %d 所有服务器已回复",rf.me)
-				mu.Unlock()
-				break
-			}
-			mu.Unlock()
-		}
-		time.Sleep(200*time.Millisecond)
+		rf.logReplicate()
+		time.Sleep(200 * time.Millisecond)
 	}
-	DPrintf("%d 不是leader ,退出心跳发送",rf.me)
+	DPrintf("%d 不是leader ,退出心跳发送", rf.me)
+}
+
+func (rf *Raft) logReplicate() {
+	count := 1
+	finish := 0
+	cn := make(chan int)
+	mu := sync.Mutex{}
+	//发送日志给所有follower
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(x int) {
+			args := AppendEntriesArgs{
+				Term:        rf.term,
+				PreLogIndex: rf.nextIndex[x] - 1, //对应follower日志的nextIndex的前一个index
+				Entries:     rf.logs[rf.nextIndex[x]:],
+			}
+			//初始没有日志的状态
+			if rf.nextIndex[x] == 0 {
+				args.PreLogTerm = -1
+			} else {
+				args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].Term
+				args.Entries = rf.logs[rf.nextIndex[x]:] //对应服务器下一个index位置的日志到日志末尾
+			}
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(x, &args, &reply)
+			mu.Lock()
+			if ok {
+				if reply.IsSuccess {
+					count++
+					rf.nextIndex[x]++
+				} else {
+					//follower同步失败，回退nextindex
+					rf.nextIndex[x]--
+				}
+			}
+			finish++
+			mu.Unlock()
+			cn <- 1
+		}(i)
+	}
+
+	for true {
+		<-cn
+		mu.Lock()
+		if count > len(rf.peers)/2 {
+			DPrintf("leader %d 日志同步成功", rf.me)
+			//超过半数服务器返回成功，认为成功，commit日志
+			//只commit 最新的logentry
+			rf.commitIndex = len(rf.logs) - 1
+			mu.Unlock()
+			break
+		}
+		//所有的server均已回应，无论是否掉线
+		if finish == len(rf.peers)-1 {
+			DPrintf("leader %d 所有服务器已回复", rf.me)
+			mu.Unlock()
+			break
+		}
+		mu.Unlock()
+	}
 }
 
 //检测heartbeat是否超时
@@ -522,59 +529,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft)startAgreement(command interface{}){
 	//将命令加到日志末尾
 	entry := LogEntry{
-		term: rf.term,
-		command: command,
+		Term: rf.term,
+		Command: command,
 	}
 	rf.logs = append(rf.logs, entry)
-	count := 0
-	finish := 0
-	cn := make(chan int)
-	mu := sync.Mutex{}
-	//发送日志给所有follower
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(x int) {
-			args := AppendEntriesArgs{
-				Term:        rf.term,
-				PreLogIndex: rf.nextIndex[x]-1,//对应follower日志的nextIndex的前一个index
-				//PreLogTerm:  rf.logs[rf.nextIndex[x]-1].term,
-				Entries:     rf.logs[rf.nextIndex[x] : ],//对应服务器下一个index位置的日志到日志末尾
-			}
-			//初始没有日志的状态
-			if rf.nextIndex[x] == 0 {
-				args.PreLogTerm = -1
-			}else{
-				args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].term
-			}
-			reply := AppendEntriesReply{}
-			rf.sendAppendEntries(x, &args, &reply)
-			mu.Lock()
-			if reply.IsSuccess {
-				count++
-			}
-			finish++
-			mu.Unlock()
-			cn<-1
-		}(i)
-	}
 
-	for true {
-		<-cn
-		mu.Lock()
-		if count > len(rf.peers)/2 {
-			//超过半数服务器返回成功，认为成功，commit日志
-			rf.commitIndex = len(rf.logs)-1
-			mu.Unlock()
-			break
-		}
-		if finish == len(rf.peers)-1 {
-			mu.Unlock()
-			break
-		}
-		mu.Unlock()
-	}
+	DPrintf("%d leader的日志 %v",rf.me,rf.logs)
+	go rf.logReplicate()
 	//这边不管是不是超过半数了，反正周期心跳也会同步日志
 
 }
