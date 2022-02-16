@@ -169,6 +169,10 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term int
 	CandidateId   int
+	//最新日志的term
+	EntryTerm     int
+	//最新日志的index
+	EntryIndex    int
 }
 
 //
@@ -184,8 +188,10 @@ type RequestVoteReply struct {
 //心跳rpc参数
 type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
-	Term int
-	CandidateId   int
+	Term         int
+	Entries		 []LogEntry
+	PreLogIndex  int
+	PreLogTerm   int
 }
 
 //
@@ -195,7 +201,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	// Your data here (2A).
 	Term          int
-	VoteGuarantee bool
+	IsSuccess     bool
 }
 //
 // example RequestVote RPC handler.
@@ -203,12 +209,17 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//判断自己当前term是否投过票
+	//election restriction : 判断自己的logentry term是否比对方大
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term == rf.term && rf.voteFor != -1 {
 		reply.VoteGuarantee = false
 	}else if args.Term < rf.term {
 		reply.VoteGuarantee = false
+	}else if len(rf.logs) > 0{
+		if args.EntryTerm < rf.logs[len(rf.logs)-1].term || args.EntryIndex < len(rf.logs)-1 {
+			reply.VoteGuarantee = false
+		}
 	}else {
 		//包含选举term大于自己的term和选举term等于自己的term但自己没投过票两种
 		rf.term = args.Term
@@ -263,11 +274,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		if reply.Term > rf.term {
-			//重新发起选举
-		}
-	}
+
 	return ok
 }
 
@@ -279,6 +286,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.term {
 		rf.term = args.Term
 		rf.serverState = Follower
+	}
+	//检测前一个entry的index和term是否符合
+	if args.PreLogIndex < len(rf.logs) {
+		if args.PreLogIndex == -1 {
+			reply.IsSuccess = true
+		}else if rf.logs[args.PreLogIndex].term == args.PreLogTerm{
+			reply.IsSuccess = true
+		}else {
+			reply.IsSuccess = false
+		}
+	}else{
+		reply.IsSuccess = false
+	}
+
+	//添加日志
+	if reply.IsSuccess {
+		rf.logs = append(rf.logs, args.Entries...)
 	}
 
 	reply.Term = rf.term
@@ -294,6 +318,7 @@ func (rf *Raft) startElection() bool{
 	//rf.voteFor = -1
 	//2.投票给自己，开始计时
 	count := 1
+	finish := 0
 	rf.voteFor = rf.me
 	startTime :=time.Now()
 	//3.并发给其他服务器发送投票请求
@@ -307,18 +332,25 @@ func (rf *Raft) startElection() bool{
 			args := RequestVoteArgs{
 				CandidateId: rf.me,
 				Term: rf.term,
+				EntryIndex: len(rf.logs)-1,
+			}
+			if len(rf.logs) == 0 {
+				args.EntryTerm = 0
+			}else {
+				args.EntryTerm = rf.logs[len(rf.logs)-1].term
 			}
 			reply := RequestVoteReply{}
 			DPrintf("%d send vote  request to %d ,term is %d",rf.me,x,rf.term)
-			getReply := rf.sendRequestVote(x,&args,&reply)
+			rf.sendRequestVote(x,&args,&reply)
 			DPrintf("%d get reply vote is %v , term is %d",rf.me,reply.VoteGuarantee,rf.term)
-			if getReply {
-				rf.mu.Lock()
-				if reply.VoteGuarantee {
-					count++
-				}
-				rf.mu.Unlock()
+
+			rf.mu.Lock()
+			if reply.VoteGuarantee {
+				count++
 			}
+			finish++
+			rf.mu.Unlock()
+
 			cn<- 1
 		}(i)
 	}
@@ -334,8 +366,16 @@ func (rf *Raft) startElection() bool{
 		if count > len(rf.peers)/2 {
 			DPrintf("leader is %d , term is %d",rf.me,rf.term)
 			rf.serverState = Leader
+			//初始化nextindex
+			for i := range rf.nextIndex {
+				rf.nextIndex[i] = len(rf.logs)
+			}
 			//如果当选leader，周期发送心跳验证
 			go rf.sendHB()
+			rf.mu.Unlock()
+			break
+		}
+		if finish == len(rf.peers)-1 {
 			rf.mu.Unlock()
 			break
 		}
@@ -349,19 +389,65 @@ func (rf *Raft) startElection() bool{
 //周期发送心跳验证
 func (rf *Raft) sendHB(){
 	for rf.serverState == Leader {
+		DPrintf("%d 发送心跳验证",rf.me)
 		//同时发送心跳验证
+		count := 0
+		finish := 0
+		cn := make(chan int)
+		mu := sync.Mutex{}
+		//发送日志给所有follower
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			go func(x int) {
 				args := AppendEntriesArgs{
-					CandidateId: x,
 					Term:        rf.term,
+					PreLogIndex: rf.nextIndex[x]-1,//对应follower日志的nextIndex的前一个index
+					Entries:     make([]LogEntry,0),
+				}
+				//初始没有日志的状态
+				if rf.nextIndex[x] == 0 {
+					args.PreLogTerm = -1
+				}else {
+					args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].term
+					args.Entries = rf.logs[rf.nextIndex[x] : ]//对应服务器下一个index位置的日志到日志末尾
 				}
 				reply := AppendEntriesReply{}
-				rf.sendAppendEntries(x, &args, &reply)
+				ok := rf.sendAppendEntries(x, &args, &reply)
+				mu.Lock()
+				if ok {
+					if reply.IsSuccess {
+						count++
+					}else {
+						//follower同步失败，回退nextindex
+						rf.nextIndex[x] = rf.nextIndex[x]-1
+					}
+				}
+				finish++
+				mu.Unlock()
+				cn<-1
 			}(i)
+		}
+
+		for true {
+			<-cn
+			mu.Lock()
+			if count > len(rf.peers)/2 {
+				DPrintf("leader %d 日志同步成功",rf.me)
+				//超过半数服务器返回成功，认为成功，commit日志
+				//只commit 最新的logentry
+				rf.commitIndex = len(rf.logs)-1
+				mu.Unlock()
+				break
+			}
+			//所有的server均已回应，无论是否掉线
+			if finish == len(rf.peers)-1 {
+				DPrintf("leader %d 所有服务器已回复",rf.me)
+				mu.Unlock()
+				break
+			}
+			mu.Unlock()
 		}
 		time.Sleep(200*time.Millisecond)
 	}
@@ -428,10 +514,70 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	//如果是leader
+	go rf.startAgreement(command)
 
 	return index, term, isLeader
 }
 
+func (rf *Raft)startAgreement(command interface{}){
+	//将命令加到日志末尾
+	entry := LogEntry{
+		term: rf.term,
+		command: command,
+	}
+	rf.logs = append(rf.logs, entry)
+	count := 0
+	finish := 0
+	cn := make(chan int)
+	mu := sync.Mutex{}
+	//发送日志给所有follower
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(x int) {
+			args := AppendEntriesArgs{
+				Term:        rf.term,
+				PreLogIndex: rf.nextIndex[x]-1,//对应follower日志的nextIndex的前一个index
+				//PreLogTerm:  rf.logs[rf.nextIndex[x]-1].term,
+				Entries:     rf.logs[rf.nextIndex[x] : ],//对应服务器下一个index位置的日志到日志末尾
+			}
+			//初始没有日志的状态
+			if rf.nextIndex[x] == 0 {
+				args.PreLogTerm = -1
+			}else{
+				args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].term
+			}
+			reply := AppendEntriesReply{}
+			rf.sendAppendEntries(x, &args, &reply)
+			mu.Lock()
+			if reply.IsSuccess {
+				count++
+			}
+			finish++
+			mu.Unlock()
+			cn<-1
+		}(i)
+	}
+
+	for true {
+		<-cn
+		mu.Lock()
+		if count > len(rf.peers)/2 {
+			//超过半数服务器返回成功，认为成功，commit日志
+			rf.commitIndex = len(rf.logs)-1
+			mu.Unlock()
+			break
+		}
+		if finish == len(rf.peers)-1 {
+			mu.Unlock()
+			break
+		}
+		mu.Unlock()
+	}
+	//这边不管是不是超过半数了，反正周期心跳也会同步日志
+
+}
 //
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
@@ -476,7 +622,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.serverState = Follower
 	rf.voteFor = -1
 	rf.heartbeatTime = time.Now()
-	//rf.electionTimeout = 150+rand.Intn(150)   //150-300ms
+	//2B
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.logs = make([]LogEntry, 0)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
