@@ -51,7 +51,7 @@ const (
 )
 
 //心跳超时时间
-const HEARTBEAT_TIMEOUT = 400
+const HEARTBEAT_TIMEOUT = 150
 var lock sync.Mutex
 
 //
@@ -86,10 +86,10 @@ type Raft struct {
 	// state a Raft server must maintain.
 	//2A
 	term      int    //选举轮次
-	serverState   ServerState  //服务器状态
+	serverState      ServerState  //服务器状态
 	electionTimeout  int   //选举超时时间
 	voteFor          int
-	heartbeatTime     time.Time
+	heartbeatTime    time.Time
 
 	//2B
 	logs			[]LogEntry
@@ -98,7 +98,7 @@ type Raft struct {
 	nextIndex       []int
 	matchIndex      []int    //每个server已知的已复制最新的logentry
 	applyCh			chan ApplyMsg
-	isDown			int   //认为自己是否下线
+	//isDown			int   //认为自己是否下线
 }
 
 //logentry结构
@@ -225,37 +225,37 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//判断自己当前term是否投过票
 	//election restriction : 判断自己的logentry term是否比对方大
-	DPrintf("%d 收到投票请求，term is %d",rf.me,args.Term)
+	DPrintf("%d 收到投票请求，term is %d ,rf.term = %d",rf.me,args.Term,rf.term)
+
+	reply.VoteGuarantee = true
+
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if args.Term == rf.term && rf.voteFor != -1 {
-		DPrintf("%d 的term是%d，args.term = %d",rf.me,rf.term,args.Term)
+		DPrintf("%d 已经投过票给 %d ,term=%d",rf.me,rf.voteFor,args.Term)
 		reply.VoteGuarantee = false
-		return
 	}else if args.Term < rf.term {
 		DPrintf("args.term < rf.term")
 		reply.VoteGuarantee = false
-		return
 	}else if len(rf.logs) > 0{
 		if args.EntryTerm < rf.logs[len(rf.logs)-1].Term{
 			reply.VoteGuarantee = false
-			return
 		}else if args.EntryTerm == rf.logs[len(rf.logs)-1].Term && args.EntryIndex < len(rf.logs)-1 {
 			reply.VoteGuarantee = false
-			return
 		}
 	}
 
+	if reply.VoteGuarantee {
 		//包含选举term大于自己的term和选举term等于自己的term但自己没投过票两种
 		rf.term = args.Term
-		reply.VoteGuarantee = true
+		//reply.VoteGuarantee = true
 		rf.voteFor = args.CandidateId
 		rf.serverState = Follower
-		//if rf.serverState == Leader{
-		//	rf.serverState = Follower
-		//}
+		rf.heartbeatTime = time.Now()
 		DPrintf("%d 投票给 %d , term is %d",rf.me,rf.voteFor,args.Term)
+	}
 
+	reply.Term = rf.term
+	rf.mu.Unlock()
 }
 
 //
@@ -301,9 +301,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//重置hearbeattime
-	if rf.serverState == Follower {
-		rf.heartbeatTime = time.Now()
-		rf.isDown = 0
+	if rf.serverState != Leader {
+		rf.serverState = Follower
 	}
 	//返回自己的term
 	//如果收到的term>自己的term
@@ -311,21 +310,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
-	if args.Term >= rf.term || args.LeaderCommit >= rf.commitIndex{
-		rf.term = args.Term
+	if args.LeaderCommit >= rf.commitIndex{
+		if rf.term < args.Term {
+			rf.term = args.Term
+		}
 		rf.serverState = Follower
+		rf.heartbeatTime = time.Now()
 		reply.Term = rf.term
 	}else {
 		//DPrintf("%d false 分支1",rf.me)
 		reply.IsSuccess = false
 		return
 	}
+	flag := false
 	//检测前一个entry的index和term是否符合
 	if args.PreLogIndex < len(rf.logs) {
 		if args.PreLogIndex == -1 {
-			reply.IsSuccess = true
+			//reply.IsSuccess = true
+			flag = true
 		}else if rf.logs[args.PreLogIndex].Term == args.PreLogTerm{
-			reply.IsSuccess = true
+			//reply.IsSuccess = true
+			//判断是不是已经过期的日志
+			lastindex := Min(len(rf.logs[args.PreLogIndex+1:]), len(args.Entries))
+			for i := 0; i < lastindex; i++ {
+				if rf.logs[args.PreLogIndex+1+i].Term != args.Entries[i].Term {
+					flag = true
+					break
+				}
+			}
+			if !flag && len(args.Entries) > len(rf.logs[args.PreLogIndex+1:]){
+				flag = true
+			}
 		}else {
 			//DPrintf("%d false 分支2",rf.me)
 			reply.IsSuccess = false
@@ -337,25 +352,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					break
 				}
 			}
+			return
 		}
 	}else{
 		//DPrintf("%d false 分支3",rf.me)
 		reply.IsSuccess = false
 		//leader的日志比follower的日志多一个以上
 		reply.ConflictFirstIndex = len(rf.logs)-1
-		if len(rf.logs) != 0 {
+		if len(rf.logs) > 0 {
 			reply.ConflictTerm = rf.logs[len(rf.logs)-1].Term
 		}
+		return
 	}
 
 	//添加日志
-	if reply.IsSuccess {
+	if flag{
 		rf.logs = append(rf.logs[ : args.PreLogIndex+1], args.Entries...)
-		if args.LeaderCommit >= rf.commitIndex {
-			rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
-		}
+		//if args.LeaderCommit >= rf.commitIndex {
+		//	rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
+		//}
 		DPrintf("%d 日志是 %v,commit index = %d ,len %d",rf.me, rf.logs,rf.commitIndex, len(rf.logs))
 	}
+	if args.LeaderCommit >= rf.commitIndex {
+		rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
+	}
+	reply.IsSuccess = true
 	//每个服务器判断是否需要提交日志
 	if rf.lastApplied < rf.commitIndex{
 		DPrintf("%d,commit index = %d",rf.me,rf.commitIndex)
@@ -366,98 +387,142 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 //开启选举流程
-func (rf *Raft) startElection() bool{
-	DPrintf("server %d start election,term is %d",rf.me,rf.term+1)
-	//1.将自己变成candidate
-	rf.serverState = Candidate
-	rf.electionTimeout = 300 + rand.Intn(150) //150-300ms
-	rf.term = rf.term + 1
-	//rf.voteFor = -1
-	//2.投票给自己，开始计时
-	disconnectCount := 0
-	count := 1
-	finish := 0
-	rf.voteFor = rf.me
-	startTime :=time.Now()
-	//3.并发给其他服务器发送投票请求
-	//var wg sync.WaitGroup
-	cn := make(chan int)
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(x int) {
-			args := RequestVoteArgs{
-				CandidateId: rf.me,
-				Term: rf.term,
-				EntryIndex: len(rf.logs)-1,
-			}
-			if len(rf.logs) == 0 {
-				args.EntryTerm = 0
-			}else {
-				args.EntryTerm = rf.logs[len(rf.logs)-1].Term
-			}
-			reply := RequestVoteReply{}
-			DPrintf("%d send vote  request to %d ,term is %d",rf.me,x,rf.term)
-			ok := rf.sendRequestVote(x,&args,&reply)
-			DPrintf("%d get reply vote is %v , term is %d",rf.me,reply.VoteGuarantee,rf.term)
-			rf.mu.Lock()
-			if ok {
-				if reply.VoteGuarantee {
-					count++
-				}
-			}else {
-				disconnectCount ++
-			}
-			finish++
-			rf.mu.Unlock()
-			cn<- 1
-		}(i)
-	}
-	//4.接收投票并统计
-	//如果选举超时，则再次发起选举
-	go rf.testElectionTimeout(startTime)
+func (rf *Raft) startElection(cond *sync.Cond) {
+	for  {
 
-	for rf.serverState == Candidate {
-		//如果收到半数以上的票数，当选为leader
-		<-cn
-		//DPrintf("channel 数据 %d ",data)
+		//1.将自己变成candidate
 		rf.mu.Lock()
-		if count > len(rf.peers)/2 {
-			DPrintf("leader is %d , term is %d",rf.me,rf.term)
-			rf.serverState = Leader
-			//初始化nextindex
-			for i := range rf.nextIndex {
-				rf.nextIndex[i] = len(rf.logs)
-			}
-			//如果当选leader，周期发送心跳验证
-			go rf.sendHB()
-			rf.mu.Unlock()
-			break
-		}
-		if disconnectCount > len(rf.peers)/2{
-			//认为自己掉线了
-			rf.serverState = Follower
-			rf.isDown = 1
-		}
-		if finish == len(rf.peers)-1 {
-			rf.mu.Unlock()
-			break
-		}
+		cond.Wait()
+		DPrintf("server %d start election,term is %d",rf.me,rf.term+1)
+		rf.serverState = Candidate
+		rf.electionTimeout = HEARTBEAT_TIMEOUT + 50 + rand.Int()%150 //150-300ms
+		rf.term = rf.term + 1
+		rf.voteFor = rf.me
+		rf.heartbeatTime =time.Now()
 		rf.mu.Unlock()
+		//rf.voteFor = -1
+		//2.投票给自己，开始计时
+		count := 1
+		finish := 0
+
+		//3.并发给其他服务器发送投票请求
+		//var wg sync.WaitGroup
+		cn := make(chan int)
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			go func(x int) {
+				args := RequestVoteArgs{
+					CandidateId: rf.me,
+					Term: rf.term,
+					EntryIndex: len(rf.logs)-1,
+				}
+				if len(rf.logs) == 0 {
+					args.EntryTerm = 0
+				}else {
+					args.EntryTerm = rf.logs[len(rf.logs)-1].Term
+				}
+				reply := RequestVoteReply{}
+				DPrintf("%d send vote  request to %d ,term is %d",rf.me,x,rf.term)
+				ok := rf.sendRequestVote(x,&args,&reply)
+				DPrintf("%d get reply vote is %v , term is %d",rf.me,reply.VoteGuarantee,rf.term)
+				rf.mu.Lock()
+				if ok {
+					if reply.VoteGuarantee && reply.Term == rf.term{
+						count++
+					}
+					if reply.Term > rf.term {
+						rf.term = reply.Term
+						rf.serverState = Follower
+					}
+				}
+				finish++
+				rf.mu.Unlock()
+				cn<- 1
+			}(i)
+		}
+		//4.接收投票并统计
+		//如果选举超时，则再次发起选举
+		//go rf.testElectionTimeout()
+		//go rf.processVoteReply(cn,cond,count,finish)
+		for rf.serverState == Candidate {
+			//如果收到半数以上的票数，当选为leader
+			<-cn
+			//DPrintf("channel 数据 %d ",data)
+			rf.mu.Lock()
+			if count > len(rf.peers)/2 {
+				DPrintf("leader is %d , term is %d",rf.me,rf.term)
+				rf.serverState = Leader
+				//初始化nextindex
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = len(rf.logs)
+				}
+				//如果当选leader，周期发送心跳验证
+				cond.Broadcast()
+				rf.mu.Unlock()
+				break
+			}
+
+			if finish == len(rf.peers)-1 {
+				cond.Broadcast()
+				rf.mu.Unlock()
+				break
+			}
+			rf.mu.Unlock()
+		}
+		DPrintf("选举结束，term %d",rf.term)
 
 	}
-	DPrintf("选举结束，term %d",rf.term)
-	return true
+
 }
 
+//func (rf *Raft)processVoteReply(cn chan int,cond *sync.Cond,count int,finish int)  {
+//	//4.接收投票并统计
+//	//如果选举超时，则再次发起选举
+//	//go rf.testElectionTimeout()
+//
+//	for rf.serverState == Candidate {
+//		//如果收到半数以上的票数，当选为leader
+//		<-cn
+//		//DPrintf("channel 数据 %d ",data)
+//		rf.mu.Lock()
+//		if count > len(rf.peers)/2 {
+//			DPrintf("leader is %d , term is %d",rf.me,rf.term)
+//			rf.serverState = Leader
+//			//初始化nextindex
+//			for i := range rf.nextIndex {
+//				rf.nextIndex[i] = len(rf.logs)
+//			}
+//			//如果当选leader，周期发送心跳验证
+//			cond.Broadcast()
+//			rf.mu.Unlock()
+//			break
+//		}
+//
+//		if finish == len(rf.peers)-1 {
+//			//cond.Broadcast()
+//			rf.mu.Unlock()
+//			break
+//		}
+//		rf.mu.Unlock()
+//	}
+//	DPrintf("选举结束，term %d",rf.term)
+//}
 //周期发送心跳验证
-func (rf *Raft) sendHB(){
-	for rf.serverState == Leader {
-		DPrintf("%d 发送心跳验证",rf.me)
-		//同时发送心跳验证
-		go rf.logReplicate()
-		time.Sleep((HEARTBEAT_TIMEOUT-100) * time.Millisecond)
+func (rf *Raft) sendHB(cond *sync.Cond){
+	for {
+		rf.mu.Lock()
+		for rf.serverState != Leader {
+			cond.Wait()
+		}
+		if rf.serverState == Leader {
+			DPrintf("%d 发送心跳验证",rf.me)
+			//同时发送心跳验证
+			go rf.logReplicate()
+		}
+		rf.mu.Unlock()
+		time.Sleep((HEARTBEAT_TIMEOUT) * time.Millisecond)
 	}
 	DPrintf("%d 不是leader ,退出心跳发送", rf.me)
 }
@@ -493,20 +558,25 @@ func (rf *Raft) logReplicate() {
 				rf.mu.Lock()
 				if ok {
 					//DPrintf("%d 返回true",x)
-					if reply.IsSuccess {
+
+					//比较返回的term，如果大于leader的term,则leader应该退出
+					if reply.Term > rf.term {
+						DPrintf("%d leader 日志不是最新，退出leader",rf.me)
+						rf.term = reply.Term
+						rf.serverState = Follower
+						//rf.heartbeatTime = time.Now()
+					}
+					//如果term小于rf.term，则丢弃
+					if reply.IsSuccess && reply.Term == rf.term{
 						count++
 						//如果发送的是空日志，不能吧nextIndex加一
 						if rf.nextIndex[x] < len(rf.logs) {
 							rf.nextIndex[x]++
 						}
-					} else {
+					} else if !reply.IsSuccess && reply.Term >= rf.term {
 						//follower同步失败，回退nextindex
 						//比较返回的term，如果大于leader的term,则leader应该退出
-						if reply.Term > rf.term {
-							DPrintf("%d leader 日志不是最新，退出leader",rf.me)
-							rf.serverState = Follower
-							rf.heartbeatTime = time.Now()
-						}else {
+						if len(rf.logs)>0 {
 							//检查日志在confictfirstindex位置的term是否和conflicterm一致
 							//如果ConflictFirstIndex = -1,说明follower目前没有日志
 							if reply.ConflictFirstIndex == -1 {
@@ -561,33 +631,32 @@ func (rf *Raft) logReplicate() {
 }
 
 //检测heartbeat是否超时
-func (rf *Raft) testHB(){
-
-	for {
-		if rf.serverState == Follower && rf.isDown != 1{
-			if time.Now().Sub(rf.heartbeatTime) > HEARTBEAT_TIMEOUT*time.Millisecond {
-				DPrintf("心跳超时")
-				go rf.startElection()
-			}
-		}
-		time.Sleep(50*time.Millisecond)
-	}
-}
+//func (rf *Raft) testHB(){
+//
+//	for {
+//		if rf.serverState == Follower {
+//			if time.Now().Sub(rf.heartbeatTime) > HEARTBEAT_TIMEOUT*time.Millisecond {
+//				DPrintf("心跳超时")
+//				go rf.startElection()
+//			}
+//		}
+//		time.Sleep(50*time.Millisecond)
+//	}
+//}
 
 //选举超时检测
-func (rf *Raft)testElectionTimeout(startTime time.Time){
+func (rf *Raft)testElectionTimeout(cond *sync.Cond){
 	for true {
 		//如果选举超时，则再次发起选举
-		if rf.serverState == Follower || rf.serverState == Leader{
-			DPrintf("检测到leader存在，退出选举")
-			break
+		//if rf.serverState == Leader{
+		//	DPrintf("%d 检测到leader存在，退出计时",rf.me)
+		//	cond.Wait()
+		//}
+		if rf.serverState != Leader && time.Now().Sub(rf.heartbeatTime) > time.Duration(rf.electionTimeout)*time.Millisecond {
+			DPrintf("%d 选举超时 term is %d",rf.me,rf.term)
+			cond.Broadcast()
 		}
-		if time.Now().Sub(startTime) > time.Duration(rf.electionTimeout)*time.Millisecond {
-			DPrintf("选举超时 term is %d",rf.term)
-			rf.startElection()
-			break
-		}
-		time.Sleep(10*time.Millisecond)
+		time.Sleep(100*time.Millisecond)
 	}
 }
 //commit日志
@@ -715,6 +784,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.serverState = Follower
 	rf.voteFor = -1
 	rf.heartbeatTime = time.Now()
+	rf.electionTimeout = HEARTBEAT_TIMEOUT
 	//2B
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -722,20 +792,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.lastApplied = -1
 	rf.commitIndex = -1
-	rf.isDown = 0
+	//rf.isDown = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	//初始化完成开始选举流程
 	//开一个线程发送投票，同时开一个线程接收投票
-	go rf.startElection()
-
-
-	//如果当选leader，周期发送心跳验证
-	//go rf.sendHB()
+	cond := sync.NewCond(&rf.mu)
+	go rf.startElection(cond)
 
 	//检测heartbeat是否超时，如果超时则重新发起选举
-	go rf.testHB()
+	//go rf.testHB()
+	go rf.testElectionTimeout(cond)
+
+	go rf.sendHB(cond)
 
 	return rf
 }

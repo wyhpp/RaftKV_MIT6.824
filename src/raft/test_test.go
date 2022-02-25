@@ -397,6 +397,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
+	DPrintf("%d,%d,%d三个服务器上线",(leader1 + 2) % servers,(leader1 + 3) % servers,(leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -409,7 +410,10 @@ func TestBackup2B(t *testing.T) {
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	//DPrintf("other is %d",other)
 	cfg.disconnect(other)
+
+	DPrintf("%d other服务器下线",other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -426,6 +430,8 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
+	DPrintf("%d,%d,%d三个服务器上线,其他下线",(leader1 + 0) % servers,(leader1 + 1) % servers,other)
+
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
@@ -435,6 +441,9 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+
+	DPrintf("所有服务器上线")
+
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()
