@@ -31,6 +31,8 @@ package raft
 //type ApplyMsg
 
 import (
+	"6.824-golabs-2020/src/labgob"
+	"bytes"
 	"log"
 	"math/rand"
 	"sync"
@@ -137,6 +139,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	Term := rf.term
+	VoteFor := rf.voteFor
+	Logs := rf.logs
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(Term)
+		e.Encode(VoteFor)
+		e.Encode(Logs)
+		data := w.Bytes()
+		rf.persister.SaveRaftState(data)
+
 }
 
 
@@ -160,6 +173,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var Term int
+	var VoteFor int
+	var Logs []LogEntry
+	if d.Decode(&Term) != nil ||
+	   d.Decode(&VoteFor) != nil ||
+		d.Decode(&Logs) != nil{
+	  	log.Fatal("raft状态反序列化失败")
+	} else {
+		rf.mu.Lock()
+	  	rf.term = Term
+	  	rf.voteFor = VoteFor
+	  	rf.logs = Logs
+	  	rf.mu.Unlock()
+	  	DPrintf("恢复数据 term = %d ,logs = %v",rf.term,rf.logs)
+	}
 }
 
 
@@ -251,7 +282,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.voteFor = args.CandidateId
 		rf.serverState = Follower
 		rf.heartbeatTime = time.Now()
+		rf.persist()
 		DPrintf("%d 投票给 %d , term is %d",rf.me,rf.voteFor,args.Term)
+	}
+
+	if rf.term <args.Term {
+		rf.term = args.Term
 	}
 
 	reply.Term = rf.term
@@ -310,15 +346,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
-	if args.LeaderCommit >= rf.commitIndex{
-		if rf.term < args.Term {
-			rf.term = args.Term
-		}
+	if rf.term <= args.Term{
+		rf.term = args.Term
+		rf.persist()
 		rf.serverState = Follower
 		rf.heartbeatTime = time.Now()
 		reply.Term = rf.term
 	}else {
-		//DPrintf("%d false 分支1",rf.me)
+		DPrintf("%d false 分支1",rf.me)
 		reply.IsSuccess = false
 		return
 	}
@@ -338,6 +373,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					break
 				}
 			}
+			//发送的日志和已有日志共同部分相同，但是发送的日志较长
 			if !flag && len(args.Entries) > len(rf.logs[args.PreLogIndex+1:]){
 				flag = true
 			}
@@ -345,8 +381,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			//DPrintf("%d false 分支2",rf.me)
 			reply.IsSuccess = false
 			//日志不一致
-			reply.ConflictTerm = rf.logs[len(rf.logs)-1].Term
-			for i := len(rf.logs)-1; i >= 0 ; i-- {
+			reply.ConflictTerm = rf.logs[args.PreLogIndex].Term
+			for i := args.PreLogIndex; i >= 0 ; i-- {
 				if rf.logs[i].Term != reply.ConflictTerm {
 					reply.ConflictFirstIndex = i+1
 					break
@@ -355,19 +391,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 	}else{
-		//DPrintf("%d false 分支3",rf.me)
+		DPrintf("%d false 分支3",rf.me)
 		reply.IsSuccess = false
 		//leader的日志比follower的日志多一个以上
 		reply.ConflictFirstIndex = len(rf.logs)-1
-		if len(rf.logs) > 0 {
-			reply.ConflictTerm = rf.logs[len(rf.logs)-1].Term
-		}
+		reply.ConflictTerm = -1
 		return
 	}
 
 	//添加日志
-	if flag{
+	if flag && len(args.Entries) != 0{
 		rf.logs = append(rf.logs[ : args.PreLogIndex+1], args.Entries...)
+		rf.persist()
 		//if args.LeaderCommit >= rf.commitIndex {
 		//	rf.commitIndex = Min(args.LeaderCommit, len(rf.logs)-1)
 		//}
@@ -400,6 +435,7 @@ func (rf *Raft) startElection(cond *sync.Cond) {
 		rf.voteFor = rf.me
 		rf.heartbeatTime =time.Now()
 		rf.mu.Unlock()
+		rf.persist()
 		//rf.voteFor = -1
 		//2.投票给自己，开始计时
 		count := 1
@@ -435,6 +471,7 @@ func (rf *Raft) startElection(cond *sync.Cond) {
 					if reply.Term > rf.term {
 						rf.term = reply.Term
 						rf.serverState = Follower
+						rf.persist()
 					}
 				}
 				finish++
@@ -558,12 +595,13 @@ func (rf *Raft) logReplicate() {
 				rf.mu.Lock()
 				if ok {
 					//DPrintf("%d 返回true",x)
-
+					DPrintf("%d conflictindex = %d",x,reply.ConflictFirstIndex)
 					//比较返回的term，如果大于leader的term,则leader应该退出
 					if reply.Term > rf.term {
 						DPrintf("%d leader 日志不是最新，退出leader",rf.me)
 						rf.term = reply.Term
 						rf.serverState = Follower
+						rf.persist()
 						//rf.heartbeatTime = time.Now()
 					}
 					//如果term小于rf.term，则丢弃
@@ -576,9 +614,11 @@ func (rf *Raft) logReplicate() {
 					} else if !reply.IsSuccess && reply.Term >= rf.term {
 						//follower同步失败，回退nextindex
 						//比较返回的term，如果大于leader的term,则leader应该退出
+						DPrintf("follower %d 同步日志失败",x)
 						if len(rf.logs)>0 {
 							//检查日志在confictfirstindex位置的term是否和conflicterm一致
 							//如果ConflictFirstIndex = -1,说明follower目前没有日志
+							//DPrintf("rf = %d , reply = %d",rf.logs[reply.ConflictFirstIndex].Term,reply.ConflictTerm)
 							if reply.ConflictFirstIndex == -1 {
 								rf.nextIndex[x] = 0
 							}else if rf.logs[reply.ConflictFirstIndex].Term == reply.ConflictTerm {
@@ -589,8 +629,11 @@ func (rf *Raft) logReplicate() {
 										break
 									}
 								}
+								//rf.nextIndex[x] = reply.ConflictFirstIndex+1
+								DPrintf("%d xxx",x)
 							}else {
 								rf.nextIndex[x] = reply.ConflictFirstIndex
+								DPrintf("%d yyy",x)
 							}
 						}
 					}
@@ -609,7 +652,9 @@ func (rf *Raft) logReplicate() {
 				//超过半数服务器返回成功，认为成功，commit日志
 				//只commit 最新的logentry
 				if rf.serverState ==Leader {
-					rf.commitIndex = len(rf.logs) - 1
+					if rf.logs[len(rf.logs)-1].Term == rf.term {
+						rf.commitIndex = len(rf.logs) - 1
+					}
 					//commitlog
 					if rf.lastApplied < rf.commitIndex {
 						go rf.commitLogs()
@@ -648,10 +693,10 @@ func (rf *Raft) logReplicate() {
 func (rf *Raft)testElectionTimeout(cond *sync.Cond){
 	for true {
 		//如果选举超时，则再次发起选举
-		//if rf.serverState == Leader{
-		//	DPrintf("%d 检测到leader存在，退出计时",rf.me)
-		//	cond.Wait()
-		//}
+		if rf.killed(){
+			DPrintf("%d shutdown退出计时",rf.me)
+			break
+		}
 		if rf.serverState != Leader && time.Now().Sub(rf.heartbeatTime) > time.Duration(rf.electionTimeout)*time.Millisecond {
 			DPrintf("%d 选举超时 term is %d",rf.me,rf.term)
 			cond.Broadcast()
@@ -667,7 +712,7 @@ func (rf *Raft)commitLogs()  {
 	//原因是append函数将特定位置的值替换为新值，并且修改logs的边界范围，但是原本存在右边界之外的值没有改，因此能取到值，但不是安全的
 	DPrintf("=======%d 提交日志 %v ,日志 %v",rf.me,rf.logs[rf.lastApplied+1:rf.commitIndex+1],rf.logs)
 	if rf.commitIndex > len(rf.logs)-1 {
-		DPrintf("commitindex = %d ,%d 日志 %v",rf.commitIndex, rf.me,rf.logs)
+		//DPrintf("commitindex = %d ,%d 日志 %v",rf.commitIndex, rf.me,rf.logs)
 		log.Fatal("日志提交出现错误：rf.commitLogs()")
 	}
 	for i := rf.lastApplied+1; i <=rf.commitIndex ; i++ {
@@ -679,7 +724,7 @@ func (rf *Raft)commitLogs()  {
 	}
 	rf.lastApplied = rf.commitIndex
 	rf.mu.Unlock()
-	return
+
 }
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -719,6 +764,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.logs = append(rf.logs, entry)
+	rf.persist()
 	rf.mu.Unlock()
 	DPrintf("%d leader的日志 %v",rf.me, rf.logs)
 	//如果是leader
@@ -727,19 +773,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (rf *Raft)startAgreement(command interface{}){
-	//将命令加到日志末尾
-	rf.mu.Lock()
-	entry := LogEntry{
-		Term: rf.term,
-		Command: command,
-	}
-	rf.logs = append(rf.logs, entry)
-	rf.mu.Unlock()
-	DPrintf("%d leader的日志 %v",rf.me, rf.logs)
-	//rf.logReplicate()
-	//这边不管是不是超过半数了，反正周期心跳也会同步日志
-}
+//func (rf *Raft)startAgreement(command interface{}){
+//	//将命令加到日志末尾
+//	rf.mu.Lock()
+//	entry := LogEntry{
+//		Term: rf.term,
+//		Command: command,
+//	}
+//	rf.logs = append(rf.logs, entry)
+//	rf.mu.Unlock()
+//	DPrintf("%d leader的日志 %v",rf.me, rf.logs)
+//	//rf.logReplicate()
+//	//这边不管是不是超过半数了，反正周期心跳也会同步日志
+//}
 //
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
