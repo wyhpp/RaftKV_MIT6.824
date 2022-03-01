@@ -370,6 +370,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
+		//DPrintf("========接收 %v ,cfg.log[%d][%d] = %v",ok,i,index,cmd1)
 		cfg.mu.Unlock()
 
 		if ok {

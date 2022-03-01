@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -590,6 +591,12 @@ func (rf *Raft) logReplicate() {
 					args.PreLogTerm = rf.logs[rf.nextIndex[x]-1].Term
 					//args.Entries = rf.logs[rf.nextIndex[x]:] //对应服务器下一个index位置的日志到日志末尾
 				}
+				//发送了空日志
+				fileEnd := len(rf.logs)
+				flag := false
+				if rf.nextIndex[x] == len(rf.logs) {
+					flag = true
+				}
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(x, &args, &reply)
 				rf.mu.Lock()
@@ -607,9 +614,11 @@ func (rf *Raft) logReplicate() {
 					//如果term小于rf.term，则丢弃
 					if reply.IsSuccess && reply.Term == rf.term{
 						count++
-						//如果发送的是空日志，不能吧nextIndex加一
-						if rf.nextIndex[x] < len(rf.logs) {
-							rf.nextIndex[x]++
+						//更新matchIndex
+						//如果发送的是空日志，不能吧nextIndex加一,也不能更新matchIndex
+						if !flag {
+							rf.nextIndex[x] = fileEnd
+							rf.matchIndex[x] = rf.nextIndex[x]-1
 						}
 					} else if !reply.IsSuccess && reply.Term >= rf.term {
 						//follower同步失败，回退nextindex
@@ -652,8 +661,16 @@ func (rf *Raft) logReplicate() {
 				//超过半数服务器返回成功，认为成功，commit日志
 				//只commit 最新的logentry
 				if rf.serverState ==Leader {
-					if rf.logs[len(rf.logs)-1].Term == rf.term {
-						rf.commitIndex = len(rf.logs) - 1
+					//1.提交的日志term必须等于当前term
+					//2.提交日志的index应当小于等于(存在n,使得大多数matchIndex[x]>=n)
+					rf.matchIndex[rf.me] = len(rf.logs)-1
+					sortMatchIndex := rf.matchIndex
+					//升序排序
+					sort.Ints(sortMatchIndex)
+					//取数组中间
+					N := sortMatchIndex[len(rf.peers)/2]
+					if N > rf.commitIndex && len(rf.logs)>N && rf.logs[N].Term == rf.term {
+						rf.commitIndex = N
 					}
 					//commitlog
 					if rf.lastApplied < rf.commitIndex {
@@ -834,6 +851,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//2B
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.matchIndex {
+		rf.matchIndex[i] = -1
+	}
 	rf.logs = make([]LogEntry, 0)
 	rf.applyCh = applyCh
 	rf.lastApplied = -1
