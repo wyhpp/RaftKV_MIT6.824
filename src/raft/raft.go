@@ -88,7 +88,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	//2A
-	term      int    //选举轮次
+	term      		 int    //选举轮次
 	serverState      ServerState  //服务器状态
 	electionTimeout  int   //选举超时时间
 	voteFor          int
@@ -101,7 +101,6 @@ type Raft struct {
 	nextIndex       []int
 	matchIndex      []int    //每个server已知的已复制最新的logentry
 	applyCh			chan ApplyMsg
-	//isDown			int   //认为自己是否下线
 }
 
 //logentry结构
@@ -674,6 +673,7 @@ func (rf *Raft) logReplicate() {
 					}
 					//commitlog
 					if rf.lastApplied < rf.commitIndex {
+						//leader准备commit,通知server
 						go rf.commitLogs()
 					}
 				}

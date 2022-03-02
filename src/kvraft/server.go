@@ -1,15 +1,15 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"6.824-golabs-2020/src/labgob"
+	"6.824-golabs-2020/src/labrpc"
+	"6.824-golabs-2020/src/raft"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +18,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType string
+
+const (
+	GetOp OpType = "Get"
+	PutOp OpType = "Put"
+	AppendOp OpType = "Append"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Opreation  OpType
+	Key        string
+	Value      string
+	ClientId   int64
 }
 
 type KVServer struct {
@@ -35,15 +46,114 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dataBase map[string]string    //存储键值对
+	notify   map[int]chan packedReply
+	latestProcessSeq     map[int64] *packedReply //最近处理的服务器id对应的seqId
+}
+
+type packedReply struct {
+	seqId  int
+	Value  string
+	Err    Err
+	isLeader bool
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	//判断自己是否是leader
+	DPrintf("get in...")
+	if _, isLeader := kv.rf.GetState(); !isLeader{
+		reply.IsLeader = false
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//防止重复发送的命令
+	//重复命令的seqId相同
+	if packedReply,ok := kv.latestProcessSeq[args.ClientId];ok {
+		if args.SeqId == packedReply.seqId {
+			//返回相应的值，因为之前的值没有到达客户端，通道被销毁了，肯定被丢弃了
+			reply.Value = packedReply.Value
+			reply.Err = packedReply.Err
+			reply.IsLeader = packedReply.isLeader
+			return
+		}
+	}
+
+	//将操作加入日志等待commit成功后返回
+	command := Op{
+		Opreation: GetOp,
+		Key:       args.Key,
+		ClientId:  args.ClientId,
+	}
+	index, _, isLeader := kv.rf.Start(command)
+	if ! isLeader {
+		reply.IsLeader = false
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//保存seqid信息
+	p := packedReply{
+		isLeader: isLeader,
+		seqId: args.SeqId,
+	}
+	kv.latestProcessSeq[args.ClientId] = &p
+
+	DPrintf("get index = %d,key = %s",index,args.Key)
+	//阻塞等待线程监控是否commit完成
+	r := <-kv.notify[index]
+	reply.Value = r.Value
+	reply.Err = r.Err
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	//判断自己是否是leader
+	DPrintf("putappend in...")
+	if _, isLeader := kv.rf.GetState(); !isLeader{
+		reply.IsLeader = false
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//重复命令的seqId相同
+	if packedReply,ok := kv.latestProcessSeq[args.ClientId];ok {
+		if args.SeqId == packedReply.seqId {
+			//返回相应的值，因为之前的值没有到达客户端，通道被销毁了，肯定被丢弃了
+			reply.Err = packedReply.Err
+			reply.IsLeader = packedReply.isLeader
+			return
+		}
+	}
+	//将操作加入日志等待commit成功后返回
+	command := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+	}
+	if args.Op == "Put"{
+		command.Opreation = PutOp
+	}else {
+		command.Opreation = AppendOp
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if ! isLeader {
+		reply.IsLeader = false
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	//保存seqid信息
+	p := packedReply{
+		isLeader: isLeader,
+		seqId: args.SeqId,
+	}
+
+	kv.latestProcessSeq[args.ClientId] = &p
+	//阻塞等待线程监控是否commit完成
+	DPrintf("putappend index = %d,command = {%s,%s}",index,args.Key,args.Value)
+	r := <-kv.notify[index]
+	reply.Err = r.Err
 }
 
 //
@@ -96,6 +206,52 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.watchingCommitment()
 
 	return kv
+}
+//监控日志是否复制到大部分服务器，如果是，leader会发送通知到applyCh中
+func (kv *KVServer) watchingCommitment(){
+	for entries := range kv.applyCh {
+		//拿到已经提交的命令
+		var value string
+		var err Err
+		command := entries.Command.(Op)
+		reply := kv.latestProcessSeq[command.ClientId]
+		switch command.Opreation {
+		case GetOp:
+			if v,ok := kv.dataBase[command.Key];ok{
+				value = v
+			}else {
+				value = ""
+				err = ErrNoKey
+			}
+			reply.Value = value
+			reply.Err = err
+			break
+		case PutOp:
+			if _,ok := kv.dataBase[command.Key];ok{
+				kv.dataBase[command.Key] = command.Value
+			}else {
+				err = ErrNoKey
+			}
+			reply.Err = err
+			break
+		case AppendOp:
+			kv.dataBase[command.Key] = command.Value
+			break
+		default:
+			log.Fatal("无效的命令")
+		}
+
+		//通知处理线程返回客户端消息
+		DPrintf("log commit,index is %d,command is %v",entries.CommandIndex,entries.Command)
+		//判断通道是否存在并关闭，假如不关闭，follower提交的日志也会发送，但接受函数已返回，导致阻塞
+		if channel, ok := kv.notify[entries.CommandIndex]; ok && channel != nil {
+			DPrintf("%d notify index %d",kv.me, entries.CommandIndex)
+			channel<-*reply
+			close(channel)
+			delete(kv.notify, entries.CommandIndex)
+		}
+	}
 }
