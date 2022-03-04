@@ -243,6 +243,16 @@ type AppendEntriesReply struct {
 	ConflictFirstIndex  int
 }
 
+type SnapshotArgs struct {
+	Snapshot     map[string]string
+	SnapshotIndex  int
+	Term         int
+}
+
+type SnapshotReply struct {
+	IsSuccess     bool
+}
+
 func Min(x, y int) int {
 	if x < y {
 		return x
@@ -692,20 +702,6 @@ func (rf *Raft) logReplicate() {
 
 }
 
-//检测heartbeat是否超时
-//func (rf *Raft) testHB(){
-//
-//	for {
-//		if rf.serverState == Follower {
-//			if time.Now().Sub(rf.heartbeatTime) > HEARTBEAT_TIMEOUT*time.Millisecond {
-//				DPrintf("心跳超时")
-//				go rf.startElection()
-//			}
-//		}
-//		time.Sleep(50*time.Millisecond)
-//	}
-//}
-
 //选举超时检测
 func (rf *Raft)testElectionTimeout(cond *sync.Cond){
 	for true {
@@ -874,4 +870,102 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.sendHB(cond)
 
 	return rf
+}
+
+func (rf *Raft)GetLogSize() int {
+	return len(rf.persister.raftstate)
+}
+
+func (rf *Raft)Snapshot(database map[string]string,index int)  {
+	//通知
+	if rf.serverState != Leader {
+		return
+	}
+	//发送给follower并等待返回
+	count := 1
+	finish := 0
+	cn := make(chan int)
+
+	//发送日志给所有follower
+	if rf.serverState == Leader {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			go func(x int) {
+				args := SnapshotArgs{
+					Term:        rf.term,
+					Snapshot:    database,
+					SnapshotIndex: index,
+				}
+				reply := SnapshotReply{}
+				ok := rf.sendSnapshot(x, &args, &reply)
+				rf.mu.Lock()
+				if ok && reply.IsSuccess{
+					count++
+				}
+				finish++
+				rf.mu.Unlock()
+				cn <- 1
+			}(i)
+		}
+
+		for rf.serverState == Leader {
+			<-cn
+			rf.mu.Lock()
+			if count > len(rf.peers)/2 {
+				DPrintf("leader %d 日志同步成功", rf.me)
+				//超过半数服务器返回成功，认为成功，删减日志，保存状态
+				if rf.serverState ==Leader {
+					rf.logs = rf.logs[index :]
+					rf.saveSnapshot(database)
+				}
+				rf.mu.Unlock()
+				break
+			}
+			//所有的server均已回应，无论是否掉线
+			if finish == len(rf.peers)-1 {
+				DPrintf("leader %d 所有服务器已回复", rf.me)
+				rf.mu.Unlock()
+				break
+			}
+			rf.mu.Unlock()
+		}
+	}
+}
+
+
+func (rf *Raft) sendSnapshot(server int, args *SnapshotArgs, reply *SnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
+	if args.Term >= rf.term && args.SnapshotIndex <= len(rf.logs){
+		reply.IsSuccess = true
+		rf.logs = rf.logs[args.SnapshotIndex :]
+		rf.saveSnapshot(args.Snapshot)
+		return
+	}
+	reply.IsSuccess = false
+
+}
+
+func (rf *Raft)saveSnapshot(snapshot map[string]string)  {
+	Term := rf.term
+	VoteFor := rf.voteFor
+	Logs := rf.logs
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(Term)
+	e.Encode(VoteFor)
+	e.Encode(Logs)
+	data := w.Bytes()
+
+	w1 := new(bytes.Buffer)
+	e1 := labgob.NewEncoder(w1)
+	e1.Encode(snapshot)
+	data1 := w1.Bytes()
+	rf.persister.SaveStateAndSnapshot(data,data1)
 }

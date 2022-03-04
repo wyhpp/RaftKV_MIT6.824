@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"6.824-golabs-2020/src/labrpc"
+	"sync"
 	"time"
 )
 import "crypto/rand"
@@ -14,6 +15,7 @@ type Clerk struct {
 	lastLeader  int  //上一次请求知道的leader
 	clientId    int64
 	seqId       int
+	mu          sync.Mutex
 }
 
 func nrand() int64 {
@@ -54,6 +56,8 @@ func (ck *Clerk) Get(key string) string {
 
 	args := GetArgs{
 		Key: key,
+		ClientId: ck.clientId,
+		SeqId: ck.seqId,
 	}
 	reply := GetReply{}
 	cn := make(chan bool)
@@ -67,13 +71,14 @@ func (ck *Clerk) Get(key string) string {
 			//超时，尝试下一个server
 			select {
 			case isOk := <-cn:
-				if isOk && reply.IsLeader{
+				if isOk && reply.Err != ErrWrongLeader{
 					DPrintf("getvalue %s ,key %s",reply.Value,key)
 					out = reply.Value
 					ck.lastLeader = i
+					ck.seqId++
 					return out
 				}
-			case <-time.After(600*time.Millisecond):
+			case <-time.After(1000*time.Millisecond):
 				DPrintf("请求服务器%d超时",i)
 			}
 
@@ -100,6 +105,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key: key,
 		Value: value,
 		Op: op,
+		ClientId: ck.clientId,
+		SeqId: ck.seqId,
 	}
 	reply := PutAppendReply{}
 	i := ck.lastLeader
@@ -115,14 +122,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			//超时，尝试下一个server
 			select {
 			case isOk := <-cn:
-				if reply.IsLeader && isOk{
+				if reply.Err != ErrWrongLeader && isOk{
+					DPrintf("返回ok,seq%d",ck.seqId)
 					ck.lastLeader = i
 					ck.seqId++
 					return
 				}
-			case <-time.After(600*time.Millisecond):
+			case <-time.After(1000*time.Millisecond):
 				DPrintf("请求服务器%d超时",i)
-				continue
 			}
 
 			i++

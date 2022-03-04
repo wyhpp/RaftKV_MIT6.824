@@ -21,7 +21,7 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
-	IsLeader  bool
+	//IsLeader  bool
 	Err Err
 }
 
@@ -35,5 +35,5 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
-	IsLeader bool
+	//IsLeader bool
 }
