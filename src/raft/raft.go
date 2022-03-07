@@ -72,6 +72,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	SnapShot     PackedSnapShot
 }
 
 //
@@ -101,12 +102,23 @@ type Raft struct {
 	nextIndex       []int
 	matchIndex      []int    //每个server已知的已复制最新的logentry
 	applyCh			chan ApplyMsg
+
+	//3B
+	latestSnapshotIndex  int  //最近一次snapshot的最后一个日志位置
 }
 
 //logentry结构
 type LogEntry struct {
 	Term 			int
 	Command         interface{}
+}
+
+//snapshot结构
+type PackedSnapShot struct {
+	Database       map[string]string
+	Index          int
+	LatestSeq      map[int64] int //最近处理的服务器id对应的seqId
+	LatestReply    map[int64] string
 }
 
 // return currentTerm and whether this server
@@ -244,12 +256,14 @@ type AppendEntriesReply struct {
 }
 
 type SnapshotArgs struct {
-	Snapshot     map[string]string
-	SnapshotIndex  int
-	Term         int
+	SnapShotBytes  []byte
+	Term           int
+	logLength      int
+	latestSnapshotIndex  int
 }
 
 type SnapshotReply struct {
+	Term          int
 	IsSuccess     bool
 }
 
@@ -567,6 +581,7 @@ func (rf *Raft) sendHB(cond *sync.Cond){
 			DPrintf("%d 发送心跳验证",rf.me)
 			//同时发送心跳验证
 			go rf.logReplicate()
+			go rf.SnapshotReplicate()
 		}
 		rf.mu.Unlock()
 		time.Sleep((HEARTBEAT_TIMEOUT) * time.Millisecond)
@@ -583,6 +598,9 @@ func (rf *Raft) logReplicate() {
 	if rf.serverState == Leader {
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
+				continue
+			}
+			if rf.nextIndex[i] <= rf.latestSnapshotIndex {
 				continue
 			}
 			go func(x int) {
@@ -854,6 +872,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.lastApplied = -1
 	rf.commitIndex = -1
+
+	rf.latestSnapshotIndex = -1
 	//rf.isDown = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -873,63 +893,70 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft)GetLogSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return len(rf.persister.raftstate)
 }
-
-func (rf *Raft)Snapshot(database map[string]string,index int)  {
+//leader收到日志进行截断和持久化
+func (rf *Raft)Snapshot(db map[string]string,index int,latestSeq map[int64]int,latestReply map[int64]string)  {
 	//通知
 	if rf.serverState != Leader {
 		return
 	}
-	//发送给follower并等待返回
-	count := 1
-	finish := 0
-	cn := make(chan int)
+	snapShot := PackedSnapShot{
+		Database:    db,
+		Index:       index,
+		LatestSeq:   latestSeq,
+		LatestReply: latestReply,
+	}
+	rf.latestSnapshotIndex = index
+	rf.logs = rf.logs[index-1 :]
+	//序列化
+	w1 := new(bytes.Buffer)
+	e1 := labgob.NewEncoder(w1)
+	e1.Encode(snapShot)
+	data1 := w1.Bytes()
+	rf.saveSnapshot(data1)
 
+}
+
+func (rf *Raft) SnapshotReplicate() {
+	//发送给follower并等待返回
+	snapShot := rf.persister.ReadSnapshot()
 	//发送日志给所有follower
 	if rf.serverState == Leader {
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
+			if rf.nextIndex[i] > rf.latestSnapshotIndex {
+				continue
+			}
 			go func(x int) {
 				args := SnapshotArgs{
-					Term:        rf.term,
-					Snapshot:    database,
-					SnapshotIndex: index,
+					Term:           rf.term,
+					logLength:      rf.latestSnapshotIndex,
+					SnapShotBytes: snapShot,
+					latestSnapshotIndex: rf.latestSnapshotIndex,
 				}
 				reply := SnapshotReply{}
 				ok := rf.sendSnapshot(x, &args, &reply)
 				rf.mu.Lock()
-				if ok && reply.IsSuccess{
-					count++
+				if ok {
+					if reply.Term > rf.term {
+						rf.term = args.Term
+						rf.serverState = Follower
+						rf.voteFor = -1
+						rf.persist()
+						rf.mu.Unlock()
+						return
+					}
+					//nextindex移到leader日志末尾
+					rf.nextIndex[x] = len(rf.logs)
+					rf.matchIndex[x] -= args.logLength
 				}
-				finish++
 				rf.mu.Unlock()
-				cn <- 1
 			}(i)
-		}
-
-		for rf.serverState == Leader {
-			<-cn
-			rf.mu.Lock()
-			if count > len(rf.peers)/2 {
-				DPrintf("leader %d 日志同步成功", rf.me)
-				//超过半数服务器返回成功，认为成功，删减日志，保存状态
-				if rf.serverState ==Leader {
-					rf.logs = rf.logs[index :]
-					rf.saveSnapshot(database)
-				}
-				rf.mu.Unlock()
-				break
-			}
-			//所有的server均已回应，无论是否掉线
-			if finish == len(rf.peers)-1 {
-				DPrintf("leader %d 所有服务器已回复", rf.me)
-				rf.mu.Unlock()
-				break
-			}
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -942,17 +969,46 @@ func (rf *Raft) sendSnapshot(server int, args *SnapshotArgs, reply *SnapshotRepl
 }
 
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
-	if args.Term >= rf.term && args.SnapshotIndex <= len(rf.logs){
-		reply.IsSuccess = true
-		rf.logs = rf.logs[args.SnapshotIndex :]
-		rf.saveSnapshot(args.Snapshot)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = args.Term
+	if args.Term < rf.term {
+		reply.IsSuccess = false
 		return
 	}
-	reply.IsSuccess = false
+	if args.Term > rf.term {
+		rf.term = args.Term
+		rf.serverState = Follower
+		rf.voteFor = -1
+		rf.persist()
+	}
+	rf.heartbeatTime = time.Now()
+	//如果leader的快照不如自己的新，则放弃该快照
+	if args.latestSnapshotIndex <= rf.latestSnapshotIndex {
+		reply.IsSuccess = false
+		return
+	}else {
+		//快照日志截取的位置比现有日志短
+		if args.latestSnapshotIndex <= len(rf.logs) {
+			leftLogs := make([]LogEntry, len(rf.logs)-args.logLength)
+			copy(leftLogs,rf.logs[args.latestSnapshotIndex :])
+			rf.logs = leftLogs
+			rf.commitIndex = rf.commitIndex-args.logLength
+			rf.lastApplied = rf.commitIndex-args.logLength
+		}else {
+			rf.logs = make([]LogEntry,0)
+			rf.commitIndex = -1
+			rf.lastApplied = -1
+		}
+		rf.latestSnapshotIndex = args.latestSnapshotIndex
+	}
 
+	rf.saveSnapshot(args.SnapShotBytes)
+	go rf.installSnapshotToServer(args.SnapShotBytes)
+	reply.IsSuccess = true
 }
 
-func (rf *Raft)saveSnapshot(snapshot map[string]string)  {
+func (rf *Raft)saveSnapshot(snapshot []byte)  {
 	Term := rf.term
 	VoteFor := rf.voteFor
 	Logs := rf.logs
@@ -963,9 +1019,33 @@ func (rf *Raft)saveSnapshot(snapshot map[string]string)  {
 	e.Encode(Logs)
 	data := w.Bytes()
 
-	w1 := new(bytes.Buffer)
-	e1 := labgob.NewEncoder(w1)
-	e1.Encode(snapshot)
-	data1 := w1.Bytes()
-	rf.persister.SaveStateAndSnapshot(data,data1)
+	rf.persister.SaveStateAndSnapshot(data,snapshot)
+}
+//把snapshot发送到server层执行
+func (rf *Raft)installSnapshotToServer(shot []byte)  {
+	r := bytes.NewBuffer(shot)
+	d := labgob.NewDecoder(r)
+	snapShot := PackedSnapShot{}
+	var Database       map[string]string
+	var Index          int
+	var LatestSeq      map[int64] int //最近处理的服务器id对应的seqId
+	var LatestReply    map[int64] string
+	if d.Decode(&Database) != nil ||
+		d.Decode(&Index) != nil ||
+		d.Decode(&LatestSeq) != nil ||
+		d.Decode(&LatestReply) != nil{
+		log.Fatal("raft状态反序列化失败")
+	} else {
+		snapShot.LatestSeq = LatestSeq
+		snapShot.Index = Index
+		snapShot.LatestReply = LatestReply
+		snapShot.Database = Database
+		//DPrintf("恢复数据 term = %d ,logs = %v",rf.term,rf.logs)
+	}
+	rf.mu.Lock()
+	rf.applyCh<-ApplyMsg{
+		CommandValid: false,
+		SnapShot: snapShot,
+	}
+	rf.mu.Unlock()
 }

@@ -37,3 +37,9 @@ type GetReply struct {
 	Value string
 	//IsLeader bool
 }
+
+type packedReply struct {
+	seqId    int
+	Value    string
+	Err      Err
+}
