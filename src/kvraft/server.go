@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 1
@@ -52,6 +53,7 @@ type KVServer struct {
 	//latestProcessSeq map[int64]*packedReply //最近处理的服务器id对应的seqId和返回值
 	latestSeq        map[int64]int
 	latestReply      map[int64]string
+	lastappliedIndex int
 }
 
 //type packedReply struct {
@@ -117,7 +119,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	DPrintf("get index = %d,key = %s", index, args.Key)
 	//阻塞等待线程监控是否commit完成
+	kv.mu.Lock()
 	kv.notify[index] = make(chan packedReply)
+	kv.mu.Unlock()
 	r := <-kv.notify[index]
 	DPrintf("client %d get value %s",args.ClientId,r.Value)
 	reply.Value = r.Value
@@ -176,7 +180,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	//kv.latestProcessSeq[args.ClientId] = args.SeqId
 	//阻塞等待线程监控是否commit完成
 	DPrintf("putappend index = %d,command = {%s,%s}", index, args.Key, args.Value)
+	kv.mu.Lock()
 	kv.notify[index] = make(chan packedReply)
+	kv.mu.Unlock()
 	r := <-kv.notify[index]
 	reply.Err = r.Err
 }
@@ -237,6 +243,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.watchingCommitment()
+	go kv.testLoglenLoop()
 
 	return kv
 }
@@ -314,19 +321,48 @@ func (kv *KVServer) watchingCommitment() {
 		//通知处理线程返回客户端消息
 		DPrintf("log commit,index is %d,command is %v", entries.CommandIndex, entries.Command)
 		//判断通道是否存在并关闭，假如不关闭，follower提交的日志也会发送，但接受函数已返回，导致阻塞
+		kv.mu.Lock()
 		if channel, ok := kv.notify[entries.CommandIndex]; ok && channel != nil {
 			DPrintf("%d notify index %d", kv.me, entries.CommandIndex)
 			//日志长度大于maxraftstate
-			if kv.maxraftstate != -1 && kv.rf.GetLogSize() >= kv.maxraftstate {
-				//发送snapshot,index
-				DPrintf("%d发送snapshot,日志长度%d",kv.me,kv.rf.GetLogSize())
-				kv.rf.Snapshot(kv.dataBase,entries.CommandIndex,kv.latestSeq,kv.latestReply)
-			}
-			kv.mu.Lock()
+			//if kv.maxraftstate != -1 && kv.rf.GetLogSize() >= kv.maxraftstate {
+			//	//发送snapshot,index
+			//	DPrintf("%d发送snapshot,日志长度%d",kv.me,kv.rf.GetLogSize())
+			//	go kv.rf.Snapshot(kv.dataBase,entries.CommandIndex,kv.latestSeq,kv.latestReply)
+			//}
+			kv.lastappliedIndex = entries.CommandIndex
 			channel <- p
 			close(channel)
 			delete(kv.notify, entries.CommandIndex)
-			kv.mu.Unlock()
+
 		}
+		kv.mu.Unlock()
+	}
+}
+
+//检测日志是否超上限
+func (kv *KVServer)testLoglenLoop(){
+	var latestSeq        map[int64]int
+	var latestReply      map[int64]string
+	var lastappliedIndex int
+	for  {
+		var dataBase         map[string]string //存储键值对
+		func() {
+			_, isleader := kv.rf.GetState()
+			if isleader && kv.maxraftstate != -1 && kv.rf.GetLogSize() >= kv.maxraftstate {
+				//发送snapshot,index
+				DPrintf("%d发送snapshot,日志长度%d", kv.me, kv.rf.GetLogSize())
+				kv.mu.Lock()
+				dataBase = kv.dataBase
+				lastappliedIndex = kv.lastappliedIndex
+				latestSeq = kv.latestSeq
+				latestReply = kv.latestReply
+				kv.mu.Unlock()
+			}
+		}()
+		if dataBase != nil {
+			kv.rf.Snapshot(dataBase, lastappliedIndex, latestSeq, latestReply)
+		}
+		time.Sleep(50*time.Millisecond)
 	}
 }
