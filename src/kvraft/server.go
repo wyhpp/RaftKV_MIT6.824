@@ -7,10 +7,9 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -124,6 +123,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 	r := <-kv.notify[index]
 	DPrintf("client %d get value %s",args.ClientId,r.Value)
+	if _, isleader2 := kv.rf.GetState();!isleader2{
+		reply.Err = ErrWrongLeader
+		return
+	}
 	reply.Value = r.Value
 	reply.Err = r.Err
 }
@@ -184,6 +187,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.notify[index] = make(chan packedReply)
 	kv.mu.Unlock()
 	r := <-kv.notify[index]
+	DPrintf("putappend index = %d,command = {%s,%s}", index, args.Key, args.Value)
+
+	if _, isleader2 := kv.rf.GetState();!isleader2{
+		reply.Err = ErrWrongLeader
+		return
+	}
 	reply.Err = r.Err
 }
 
@@ -241,15 +250,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	cond := sync.NewCond(&kv.mu)
 	// You may need initialization code here.
-	go kv.watchingCommitment()
-	go kv.testLoglenLoop()
+	go kv.watchingCommitment(cond)
+	go kv.testLoglenLoop(cond)
 
 	return kv
 }
 
 //监控日志是否复制到大部分服务器，如果是，leader会发送通知到applyCh中
-func (kv *KVServer) watchingCommitment() {
+func (kv *KVServer) watchingCommitment(cond *sync.Cond) {
 	for entries := range kv.applyCh {
 		//commit snapshot时CommandValid为false
 		if !entries.CommandValid {
@@ -324,28 +334,25 @@ func (kv *KVServer) watchingCommitment() {
 		kv.mu.Lock()
 		if channel, ok := kv.notify[entries.CommandIndex]; ok && channel != nil {
 			DPrintf("%d notify index %d", kv.me, entries.CommandIndex)
-			//日志长度大于maxraftstate
-			//if kv.maxraftstate != -1 && kv.rf.GetLogSize() >= kv.maxraftstate {
-			//	//发送snapshot,index
-			//	DPrintf("%d发送snapshot,日志长度%d",kv.me,kv.rf.GetLogSize())
-			//	go kv.rf.Snapshot(kv.dataBase,entries.CommandIndex,kv.latestSeq,kv.latestReply)
-			//}
 			kv.lastappliedIndex = entries.CommandIndex
 			channel <- p
 			close(channel)
 			delete(kv.notify, entries.CommandIndex)
-
+			cond.Broadcast()
 		}
 		kv.mu.Unlock()
 	}
 }
 
 //检测日志是否超上限
-func (kv *KVServer)testLoglenLoop(){
+func (kv *KVServer)testLoglenLoop(cond *sync.Cond){
 	var latestSeq        map[int64]int
 	var latestReply      map[int64]string
 	var lastappliedIndex int
 	for  {
+		kv.mu.Lock()
+		cond.Wait()
+		kv.mu.Unlock()
 		var dataBase         map[string]string //存储键值对
 		func() {
 			_, isleader := kv.rf.GetState()
@@ -363,6 +370,6 @@ func (kv *KVServer)testLoglenLoop(){
 		if dataBase != nil {
 			kv.rf.Snapshot(dataBase, lastappliedIndex, latestSeq, latestReply)
 		}
-		time.Sleep(50*time.Millisecond)
+		//time.Sleep(50*time.Millisecond)
 	}
 }

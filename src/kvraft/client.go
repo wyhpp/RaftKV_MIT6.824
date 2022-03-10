@@ -78,7 +78,7 @@ func (ck *Clerk) Get(key string) string {
 					ck.seqId++
 					return out
 				}
-			case <-time.After(1000*time.Millisecond):
+			case <-time.After(600*time.Millisecond):
 				DPrintf("请求服务器%d超时",i)
 			}
 
@@ -113,7 +113,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for  {
 		cn := make(chan bool)
 			go func(x int) {
-				DPrintf("send putappend to server %d ，key is %s ,v is %s",x,key,value)
+				DPrintf("send putappend to server %d ，key is %s ,v is %s ,seq is %d",x,key,value,ck.seqId)
 				ok := ck.servers[x].Call("KVServer.PutAppend", &args, &reply)
 				if cn != nil {
 					cn<-ok

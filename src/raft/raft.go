@@ -246,6 +246,9 @@ type AppendEntriesArgs struct {
 	PreLogTerm   int
 	LeaderCommit int
 	LeaderId     int
+	SnapShotBytes  []byte
+	LastSnapshotIndex  int
+	LastSnapshotTerm   int
 }
 
 //
@@ -389,7 +392,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("%d 收到日志 %v",rf.me,args.Entries)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	logpos := rf.leaderIndex2logpos(args.PreLogIndex)
+	//logpos := rf.leaderIndex2logpos(args.PreLogIndex)
 	flag := false
 	reply.Term = rf.term
 	if rf.term <= args.Term{
@@ -403,10 +406,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.IsSuccess = false
 		return
 	}
+	//判断快照
+	//如果leader快照不如自己的新，则放弃
+	if args.LastSnapshotIndex < rf.lastSnapshotIndex {
+		//snapshot的日志都是已提交的，出现这种情况说明leader有问题，应该退出leader
+		reply.Term = args.Term+1
+		reply.IsSuccess = false
+		return
+	}else if args.LastSnapshotIndex == rf.lastSnapshotIndex{
 
+	} else {
+		//快照日志截取的位置比现有日志短
+		lastIndex := rf.getLastIndex()
+		if args.LastSnapshotIndex < lastIndex {
+			//和leader的lastsnapshotterm有冲突，舍弃所有日志
+			if rf.logs[rf.leaderIndex2logpos(args.LastSnapshotIndex)].Term != args.LastSnapshotTerm {
+				rf.logs = make([]LogEntry,0)
+
+			}else {
+				leftLogs := make([]LogEntry, lastIndex-args.LastSnapshotIndex)
+				copy(leftLogs,rf.logs[rf.leaderIndex2logpos(rf.lastSnapshotIndex+1) :])
+				rf.logs = leftLogs
+			}
+		}else {
+			rf.logs = make([]LogEntry,0)
+		}
+		rf.lastSnapshotIndex = args.LastSnapshotIndex
+		rf.lastSnapshotTerm = args.LastSnapshotTerm
+		rf.lastApplied = args.LastSnapshotIndex
+		rf.saveSnapshot(args.SnapShotBytes)
+		go rf.installSnapshotToServer(args.SnapShotBytes)
+	}
+
+	logpos := rf.leaderIndex2logpos(args.PreLogIndex)
+	//更新快照后，判断日志
 	if args.PreLogIndex < rf.lastSnapshotIndex {
 		//prelogindex落在snapshot内
 		reply.ConflictFirstIndex = rf.lastSnapshotIndex
+		reply.ConflictTerm = rf.lastSnapshotTerm
 		reply.IsSuccess = false
 		return
 	}else if args.PreLogIndex == rf.lastSnapshotIndex{
@@ -414,6 +451,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("prelogterm = %d,lastterm = %d",args.PreLogTerm,rf.lastSnapshotTerm)
 		if args.PreLogTerm != rf.lastSnapshotTerm {
 			reply.ConflictFirstIndex = rf.lastSnapshotIndex
+			reply.ConflictTerm = rf.lastSnapshotTerm
 			reply.IsSuccess = false
 			return
 		}
@@ -589,7 +627,7 @@ func (rf *Raft) sendHB(cond *sync.Cond){
 		if rf.serverState == Leader {
 			DPrintf("%d 发送心跳验证",rf.me)
 			//同时发送心跳验证
-			go rf.SnapshotReplicate()
+			//go rf.SnapshotReplicate()
 			go rf.logReplicate()
 		}
 		rf.mu.Unlock()
@@ -597,7 +635,12 @@ func (rf *Raft) sendHB(cond *sync.Cond){
 	}
 	DPrintf("%d 不是leader ,退出心跳发送", rf.me)
 }
-
+/**
+改造：每一次发送日志都附带上snapshot,由follower判断是否应用。
+原则：如果snapshotindex相等，忽略snapshot,走后面logreplicate流程
+如果snapshot大于leadersnapshot,忽略直接返回
+如果小于，应用，将conflictindex移到现存日志开始处
+ */
 func (rf *Raft) logReplicate() {
 	count := 1
 	finish := 0
@@ -605,22 +648,37 @@ func (rf *Raft) logReplicate() {
 
 	//发送日志给所有follower
 	if rf.serverState == Leader {
+		snapshot := rf.persister.ReadSnapshot()
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
-			if rf.nextIndex[i] <= rf.lastSnapshotIndex {
-				continue
-			}
+			//if rf.nextIndex[i] <= rf.lastSnapshotIndex {
+			//	continue
+			//}
+
 			go func(x int) {
-				nextIndexPos := rf.leaderIndex2logpos(rf.nextIndex[x])
+				var nextIndexPos int
+				rf.mu.Lock()
+				DPrintf("nextIndex[%d] = %d",x,rf.nextIndex[x])
+				if rf.nextIndex[x] <= rf.lastSnapshotIndex {
+					//如果nextindex 在snapshot之内，说明follower的snapshot落后leader,
+					//应该同步snapshot,将nextindex移到日志末尾
+					nextIndexPos = 0
+				}else{
+					nextIndexPos = rf.leaderIndex2logpos(rf.nextIndex[x])
+				}
 				args := AppendEntriesArgs{
 					Term:        rf.term,
 					PreLogIndex: rf.nextIndex[x] - 1, //对应follower日志的nextIndex的前一个index
 					Entries:     rf.logs[nextIndexPos:],
 					LeaderCommit: rf.commitIndex,
 					LeaderId:     rf.me,
+					SnapShotBytes: snapshot,
+					LastSnapshotIndex: rf.lastSnapshotIndex,
+					LastSnapshotTerm: rf.lastSnapshotTerm,
 				}
+
 				//初始没有日志的状态
 				if nextIndexPos == 0 {
 					args.PreLogTerm = rf.lastSnapshotTerm
@@ -629,7 +687,11 @@ func (rf *Raft) logReplicate() {
 					//args.Entries = rf.logs[rf.nextIndex[x]:] //对应服务器下一个index位置的日志到日志末尾
 				}
 				//发送了空日志
+				//记录发送时的日志末尾位置和snapshotindex，防止信息返回时改变
 				fileEnd := len(rf.logs)
+				sentSnapshotIndex := rf.lastSnapshotIndex
+
+				rf.mu.Unlock()
 				//flag := false
 				//if nextIndexPos == fileEnd {
 				//	flag = true
@@ -657,7 +719,7 @@ func (rf *Raft) logReplicate() {
 						//	//rf.nextIndex[x] = fileEnd
 						//	rf.matchIndex[x] = rf.nextIndex[x]-1
 						//}
-						rf.nextIndex[x] = fileEnd + rf.lastSnapshotIndex + 1
+						rf.nextIndex[x] = fileEnd + sentSnapshotIndex + 1
 						rf.matchIndex[x] = rf.nextIndex[x]-1
 					} else if !reply.IsSuccess && reply.Term == rf.term {
 						//follower同步失败，回退nextindex
@@ -933,6 +995,7 @@ func (rf *Raft)Snapshot(db map[string]string,index int,latestSeq map[int64]int,l
 	rf.lastSnapshotIndex += index
 	rf.lastSnapshotTerm = rf.logs[index-1].Term
 	rf.logs = rf.logs[index :]
+	DPrintf("lastSnapshotIndex = %d",rf.lastSnapshotIndex)
 	//序列化
 	w1 := new(bytes.Buffer)
 	e1 := labgob.NewEncoder(w1)
@@ -941,106 +1004,106 @@ func (rf *Raft)Snapshot(db map[string]string,index int,latestSeq map[int64]int,l
 	rf.saveSnapshot(data1)
 }
 
-func (rf *Raft) SnapshotReplicate() {
-	//发送给follower并等待返回
-	snapShot := rf.persister.ReadSnapshot()
-	//DPrintf("读到snapshotbytes %v",snapShot)
-	//发送日志给所有follower
-	if rf.serverState == Leader {
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			if rf.nextIndex[i] > rf.lastSnapshotIndex+1 {
-				continue
-			}
-			go func(x int) {
-				args := SnapshotArgs{
-					Term:           rf.term,
-					//Offset:         0,
-					SnapShotBytes: snapShot,
-					LastSnapshotIndex: rf.lastSnapshotIndex,
-					LastSnapshotTerm:  rf.lastSnapshotTerm,
-				}
-				reply := SnapshotReply{}
-				ok := rf.sendSnapshot(x, &args, &reply)
-				rf.mu.Lock()
-				if ok {
-					if reply.Term > rf.term {
-						rf.term = args.Term
-						rf.serverState = Follower
-						rf.voteFor = -1
-						rf.persist()
-						rf.mu.Unlock()
-						return
-					}
-					//nextindex移到leader日志末尾
-					rf.nextIndex[x] = rf.lastSnapshotIndex + 1
-					rf.matchIndex[x] = rf.lastSnapshotIndex + 1
-				}
-				rf.mu.Unlock()
-			}(i)
-		}
-	}
-}
-
-
-func (rf *Raft) sendSnapshot(server int, args *SnapshotArgs, reply *SnapshotReply) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-
-	return ok
-}
-//follower处理快照函数
-func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
-	DPrintf("%d 收到snapshot",rf.me)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	reply.Term = args.Term
-	if args.Term < rf.term {
-		reply.IsSuccess = false
-		return
-	}
-	if args.Term > rf.term {
-		rf.term = args.Term
-		rf.serverState = Follower
-		rf.voteFor = -1
-		rf.persist()
-	}
-	rf.heartbeatTime = time.Now()
-	//如果leader的快照不如自己的新，则放弃该快照
-	if args.LastSnapshotIndex <= rf.lastSnapshotIndex {
-		reply.IsSuccess = false
-		return
-	}else {
-		//快照日志截取的位置比现有日志短
-		lastIndex := rf.getLastIndex()
-		if args.LastSnapshotIndex < lastIndex {
-			//和leader的lastsnapshotterm有冲突，舍弃所有日志
-			if rf.logs[rf.leaderIndex2logpos(args.LastSnapshotIndex)].Term != args.LastSnapshotTerm {
-				rf.logs = make([]LogEntry,0)
-				//rf.commitIndex = -1
-				//rf.lastApplied = -1
-			}else {
-				leftLogs := make([]LogEntry, lastIndex-args.LastSnapshotIndex)
-				copy(leftLogs,rf.logs[rf.leaderIndex2logpos(rf.lastSnapshotIndex+1) :])
-				rf.logs = leftLogs
-				//rf.commitIndex = rf.commitIndex-args.LastSnapshotIndex-1
-				//rf.lastApplied = rf.lastApplied-args.LastSnapshotIndex-1
-			}
-		}else {
-			rf.logs = make([]LogEntry,0)
-			//rf.commitIndex = -1
-			//rf.lastApplied = -1
-		}
-		rf.lastSnapshotIndex = args.LastSnapshotIndex
-		rf.lastSnapshotTerm = args.LastSnapshotTerm
-		rf.lastApplied = args.LastSnapshotIndex
-	}
-	//DPrintf("snapshotbytes %v",args.SnapShotBytes)
-	rf.saveSnapshot(args.SnapShotBytes)
-	go rf.installSnapshotToServer(args.SnapShotBytes)
-	reply.IsSuccess = true
-}
+//func (rf *Raft) SnapshotReplicate() {
+//	//发送给follower并等待返回
+//	snapShot := rf.persister.ReadSnapshot()
+//	//DPrintf("读到snapshotbytes %v",snapShot)
+//	//发送日志给所有follower
+//	if rf.serverState == Leader {
+//		for i := 0; i < len(rf.peers); i++ {
+//			if i == rf.me {
+//				continue
+//			}
+//			if rf.nextIndex[i] > rf.lastSnapshotIndex+1 {
+//				continue
+//			}
+//			go func(x int) {
+//				args := SnapshotArgs{
+//					Term:           rf.term,
+//					//Offset:         0,
+//					SnapShotBytes: snapShot,
+//					LastSnapshotIndex: rf.lastSnapshotIndex,
+//					LastSnapshotTerm:  rf.lastSnapshotTerm,
+//				}
+//				reply := SnapshotReply{}
+//				ok := rf.sendSnapshot(x, &args, &reply)
+//				rf.mu.Lock()
+//				if ok {
+//					if reply.Term > rf.term {
+//						rf.term = args.Term
+//						rf.serverState = Follower
+//						rf.voteFor = -1
+//						rf.persist()
+//						rf.mu.Unlock()
+//						return
+//					}
+//					//nextindex移到leader日志末尾
+//					rf.nextIndex[x] = rf.lastSnapshotIndex + 1
+//					rf.matchIndex[x] = rf.lastSnapshotIndex + 1
+//				}
+//				rf.mu.Unlock()
+//			}(i)
+//		}
+//	}
+//}
+//
+//
+//func (rf *Raft) sendSnapshot(server int, args *SnapshotArgs, reply *SnapshotReply) bool {
+//	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+//
+//	return ok
+//}
+////follower处理快照函数
+//func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
+//	DPrintf("%d 收到snapshot",rf.me)
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//	reply.Term = args.Term
+//	if args.Term < rf.term {
+//		reply.IsSuccess = false
+//		return
+//	}
+//	if args.Term > rf.term {
+//		rf.term = args.Term
+//		rf.serverState = Follower
+//		rf.voteFor = -1
+//		rf.persist()
+//	}
+//	rf.heartbeatTime = time.Now()
+//	//如果leader的快照不如自己的新，则放弃该快照
+//	if args.LastSnapshotIndex <= rf.lastSnapshotIndex {
+//		reply.IsSuccess = false
+//		return
+//	}else {
+//		//快照日志截取的位置比现有日志短
+//		lastIndex := rf.getLastIndex()
+//		if args.LastSnapshotIndex < lastIndex {
+//			//和leader的lastsnapshotterm有冲突，舍弃所有日志
+//			if rf.logs[rf.leaderIndex2logpos(args.LastSnapshotIndex)].Term != args.LastSnapshotTerm {
+//				rf.logs = make([]LogEntry,0)
+//				//rf.commitIndex = -1
+//				//rf.lastApplied = -1
+//			}else {
+//				leftLogs := make([]LogEntry, lastIndex-args.LastSnapshotIndex)
+//				copy(leftLogs,rf.logs[rf.leaderIndex2logpos(rf.lastSnapshotIndex+1) :])
+//				rf.logs = leftLogs
+//				//rf.commitIndex = rf.commitIndex-args.LastSnapshotIndex-1
+//				//rf.lastApplied = rf.lastApplied-args.LastSnapshotIndex-1
+//			}
+//		}else {
+//			rf.logs = make([]LogEntry,0)
+//			//rf.commitIndex = -1
+//			//rf.lastApplied = -1
+//		}
+//		rf.lastSnapshotIndex = args.LastSnapshotIndex
+//		rf.lastSnapshotTerm = args.LastSnapshotTerm
+//		rf.lastApplied = args.LastSnapshotIndex
+//	}
+//	//DPrintf("snapshotbytes %v",args.SnapShotBytes)
+//	rf.saveSnapshot(args.SnapShotBytes)
+//	go rf.installSnapshotToServer(args.SnapShotBytes)
+//	reply.IsSuccess = true
+//}
 
 func (rf *Raft)saveSnapshot(snapshot []byte)  {
 	Term := rf.term
