@@ -106,7 +106,8 @@ type Raft struct {
 	//3B
 	lastSnapshotIndex  int  //最近一次snapshot的最后一个日志位置
 	lastSnapshotTerm   int
-	followerlastSnapshotIndex  []int
+	snapshot           []byte
+	//followerlastSnapshotIndex  []int
 }
 
 //logentry结构
@@ -146,7 +147,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist() []byte{
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -158,14 +159,18 @@ func (rf *Raft) persist() {
 	Term := rf.term
 	VoteFor := rf.voteFor
 	Logs := rf.logs
+	LastSnapshotInd := rf.lastSnapshotIndex
+	LastSnapshotTerm := rf.lastSnapshotTerm
 		w := new(bytes.Buffer)
 		e := labgob.NewEncoder(w)
 		e.Encode(Term)
 		e.Encode(VoteFor)
 		e.Encode(Logs)
+		e.Encode(LastSnapshotInd)
+		e.Encode(LastSnapshotTerm)
 		data := w.Bytes()
 		rf.persister.SaveRaftState(data)
-
+		return data
 }
 
 
@@ -195,17 +200,21 @@ func (rf *Raft) readPersist(data []byte) {
 	var Term int
 	var VoteFor int
 	var Logs []LogEntry
+	var LastSnapshotInd int
+	var LastSnapshotTerm int
 	if d.Decode(&Term) != nil ||
 	   d.Decode(&VoteFor) != nil ||
-		d.Decode(&Logs) != nil{
+		d.Decode(&Logs) != nil ||
+		d.Decode(&LastSnapshotInd) != nil ||
+		d.Decode(&LastSnapshotTerm) != nil {
 	  	log.Fatal("raft状态反序列化失败")
 	} else {
-		rf.mu.Lock()
 	  	rf.term = Term
 	  	rf.voteFor = VoteFor
 	  	rf.logs = Logs
-	  	rf.mu.Unlock()
-	  	DPrintf("恢复数据 term = %d ,logs = %v",rf.term,rf.logs)
+	  	rf.lastSnapshotIndex = LastSnapshotInd
+	  	rf.lastSnapshotTerm = LastSnapshotTerm
+	  	DPrintf("%d 恢复数据 term = %d ,logs = %v",rf.me,rf.term,rf.logs)
 	}
 }
 
@@ -306,7 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if len(rf.logs) > 0{
 		if args.EntryTerm < rf.logs[len(rf.logs)-1].Term{
 			reply.VoteGuarantee = false
-		}else if args.EntryTerm == rf.logs[len(rf.logs)-1].Term && args.EntryIndex < len(rf.logs)-1 {
+		}else if args.EntryTerm == rf.logs[len(rf.logs)-1].Term && args.EntryIndex < rf.getLastIndex() {
 			reply.VoteGuarantee = false
 		}
 	}
@@ -409,8 +418,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//判断快照
 	//如果leader快照不如自己的新，则放弃
 	if args.LastSnapshotIndex < rf.lastSnapshotIndex {
-		//snapshot的日志都是已提交的，出现这种情况说明leader有问题，应该退出leader
-		reply.Term = args.Term+1
 		reply.IsSuccess = false
 		return
 	}else if args.LastSnapshotIndex == rf.lastSnapshotIndex{
@@ -425,7 +432,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			}else {
 				leftLogs := make([]LogEntry, lastIndex-args.LastSnapshotIndex)
-				copy(leftLogs,rf.logs[rf.leaderIndex2logpos(rf.lastSnapshotIndex+1) :])
+				copy(leftLogs,rf.logs[rf.leaderIndex2logpos(args.LastSnapshotIndex+1) :])
 				rf.logs = leftLogs
 			}
 		}else {
@@ -434,6 +441,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastSnapshotIndex = args.LastSnapshotIndex
 		rf.lastSnapshotTerm = args.LastSnapshotTerm
 		rf.lastApplied = args.LastSnapshotIndex
+		rf.snapshot = args.SnapShotBytes
 		rf.saveSnapshot(args.SnapShotBytes)
 		go rf.installSnapshotToServer(args.SnapShotBytes)
 	}
@@ -536,8 +544,8 @@ func (rf *Raft) startElection(cond *sync.Cond) {
 		rf.term = rf.term + 1
 		rf.voteFor = rf.me
 		rf.heartbeatTime =time.Now()
-		rf.mu.Unlock()
 		rf.persist()
+		rf.mu.Unlock()
 		//rf.voteFor = -1
 		//2.投票给自己，开始计时
 		count := 1
@@ -619,7 +627,7 @@ func (rf *Raft) startElection(cond *sync.Cond) {
 
 //周期发送心跳验证
 func (rf *Raft) sendHB(cond *sync.Cond){
-	for {
+	for ! rf.killed(){
 		rf.mu.Lock()
 		for rf.serverState != Leader {
 			cond.Wait()
@@ -648,7 +656,10 @@ func (rf *Raft) logReplicate() {
 
 	//发送日志给所有follower
 	if rf.serverState == Leader {
-		snapshot := rf.persister.ReadSnapshot()
+		//snapshot := rf.persister.ReadSnapshot()
+		rf.mu.Lock()
+		snapshot := rf.snapshot
+		rf.mu.Unlock()
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
@@ -801,7 +812,11 @@ func (rf *Raft)testElectionTimeout(cond *sync.Cond){
 	for true {
 		//如果选举超时，则再次发起选举
 		if rf.killed(){
-			DPrintf("%d shutdown退出计时",rf.me)
+			DPrintf("%d shutdown退出计时，日志是%v",rf.me,rf.logs)
+			//给server发消息
+			rf.applyCh<-ApplyMsg{
+				CommandValid: false,
+			}
 			break
 		}
 		rf.mu.Lock()
@@ -827,7 +842,8 @@ func (rf *Raft)commitLogs()  {
 	for i := rf.lastApplied+1; i <=rf.commitIndex ; i++ {
 		rf.applyCh<-ApplyMsg{
 			CommandValid: true,
-			CommandIndex: rf.leaderIndex2logpos(i+1),
+			//CommandIndex: i+1,      //lab2中test检查日志从下标1开始
+			CommandIndex: i,
 			Command: rf.logs[rf.leaderIndex2logpos(i)].Command,
 			}
 	}
@@ -866,7 +882,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	//将命令加到日志末尾
 	rf.mu.Lock()
-	index = len(rf.logs)+1
+	index = rf.getLastIndex()+1
 	term = rf.term
 	entry := LogEntry{
 		Term: rf.term,
@@ -953,10 +969,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.lastSnapshotIndex = -1
 	rf.lastSnapshotTerm = -1
-	rf.followerlastSnapshotIndex = make([]int, len(rf.peers))
+	//rf.followerlastSnapshotIndex = make([]int, len(rf.peers))
 	//rf.isDown = 0
 	// initialize from state persisted before a crash
+	rf.snapshot = persister.ReadSnapshot()
+	go rf.installSnapshotToServer(rf.snapshot)
+
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.lastApplied = rf.lastSnapshotIndex
+	rf.commitIndex = rf.lastSnapshotIndex
+	//读snapshot，并且发送给server层安装
+
 
 	//初始化完成开始选举流程
 	//开一个线程发送投票，同时开一个线程接收投票
@@ -992,15 +1016,18 @@ func (rf *Raft)Snapshot(db map[string]string,index int,latestSeq map[int64]int,l
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//从-1开始，表示snapshot包含的最后一个日志index
-	rf.lastSnapshotIndex += index
-	rf.lastSnapshotTerm = rf.logs[index-1].Term
-	rf.logs = rf.logs[index :]
-	DPrintf("lastSnapshotIndex = %d",rf.lastSnapshotIndex)
+	rf.lastSnapshotTerm = rf.logs[rf.leaderIndex2logpos(index)].Term
+	leftLogs := make([]LogEntry, rf.getLastIndex()-index)
+	copy(leftLogs,rf.logs[rf.leaderIndex2logpos(index)+1 :])
+	rf.logs = leftLogs
+	DPrintf("上一次index =%d ,lastSnapshotIndex = %d,日志长度%d",rf.lastSnapshotIndex,index, len(rf.logs))
+	rf.lastSnapshotIndex = index
 	//序列化
 	w1 := new(bytes.Buffer)
 	e1 := labgob.NewEncoder(w1)
 	e1.Encode(snapShot)
 	data1 := w1.Bytes()
+	rf.snapshot = data1
 	rf.saveSnapshot(data1)
 }
 
@@ -1106,17 +1133,21 @@ func (rf *Raft)Snapshot(db map[string]string,index int,latestSeq map[int64]int,l
 //}
 
 func (rf *Raft)saveSnapshot(snapshot []byte)  {
-	Term := rf.term
-	VoteFor := rf.voteFor
-	Logs := rf.logs
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(Term)
-	e.Encode(VoteFor)
-	e.Encode(Logs)
-	data := w.Bytes()
-
-	go rf.persister.SaveStateAndSnapshot(data,snapshot)
+	//Term := rf.term
+	//VoteFor := rf.voteFor
+	//Logs := rf.logs
+	//LastSnapshotInd := rf.lastSnapshotIndex
+	//LastSnapshotTerm := rf.lastSnapshotTerm
+	//w := new(bytes.Buffer)
+	//e := labgob.NewEncoder(w)
+	//e.Encode(Term)
+	//e.Encode(VoteFor)
+	//e.Encode(Logs)
+	//e.Encode(LastSnapshotInd)
+	//e.Encode(LastSnapshotTerm)
+	//data := w.Bytes()
+	persist := rf.persist()
+	rf.persister.SaveStateAndSnapshot(persist,snapshot)
 }
 //把snapshot发送到server层执行
 func (rf *Raft)installSnapshotToServer(shot []byte)  {

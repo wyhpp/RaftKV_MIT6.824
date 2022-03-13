@@ -71,7 +71,7 @@ type KVServer struct {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	//判断自己是否是leader
-	DPrintf("get in...")
+	//DPrintf("get in...")
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		//reply.IsLeader = false
 		reply.Err = ErrWrongLeader
@@ -134,7 +134,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	//判断自己是否是leader
-	DPrintf("putappend in...")
+	//DPrintf("putappend in...")
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		//reply.IsLeader = false
 		reply.Err = ErrWrongLeader
@@ -249,6 +249,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	DPrintf("启动%d服务器",kv.me)
 
 	cond := sync.NewCond(&kv.mu)
 	// You may need initialization code here.
@@ -262,10 +263,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) watchingCommitment(cond *sync.Cond) {
 	for entries := range kv.applyCh {
 		//commit snapshot时CommandValid为false
-		if !entries.CommandValid {
+		if kv.killed() {
+			DPrintf("%d服务器killed",kv.me)
+			cond.Broadcast()
+			break
+		}
+		if !entries.CommandValid && entries.SnapShot.Index > kv.lastappliedIndex{
 			kv.dataBase = entries.SnapShot.Database
 			kv.latestSeq = entries.SnapShot.LatestSeq
 			kv.latestReply = entries.SnapShot.LatestReply
+			DPrintf("server %d db is %v",kv.me,kv.dataBase)
 			continue
 		}
 		//拿到已经提交的命令
@@ -315,7 +322,7 @@ func (kv *KVServer) watchingCommitment(cond *sync.Cond) {
 			kv.mu.Unlock()
 		}else {
 			kv.mu.Lock()
-			//value = kv.dataBase[command.Key]
+			value = kv.latestReply[command.ClientId]
 			err = OK
 			//p = *kv.latestProcessSeq[command.ClientId]
 			//p = *latestreply
@@ -353,6 +360,10 @@ func (kv *KVServer)testLoglenLoop(cond *sync.Cond){
 		kv.mu.Lock()
 		cond.Wait()
 		kv.mu.Unlock()
+		if kv.killed() {
+			DPrintf("%dsever退出",kv.me)
+			break
+		}
 		var dataBase         map[string]string //存储键值对
 		func() {
 			_, isleader := kv.rf.GetState()

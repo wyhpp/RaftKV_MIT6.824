@@ -64,7 +64,7 @@ func (ck *Clerk) Get(key string) string {
 	i :=ck.lastLeader
 	for  {
 			go func(x int) {
-				DPrintf("send get to server %d",x)
+				DPrintf("send get to server %d,seq is %d",x,ck.seqId)
 				ok := ck.servers[x].Call("KVServer.Get", &args, &reply)
 				cn<-ok
 			}(i)
@@ -72,7 +72,7 @@ func (ck *Clerk) Get(key string) string {
 			select {
 			case isOk := <-cn:
 				if isOk && reply.Err != ErrWrongLeader{
-					DPrintf("getvalue %s ,key %s",reply.Value,key)
+					DPrintf("getvalue %s ,key %s,seq is %d",reply.Value,key,ck.seqId)
 					out = reply.Value
 					ck.lastLeader = i
 					ck.seqId++
