@@ -1,6 +1,6 @@
 package models
 
-import "../porcupine"
+import "6.824-golabs-2020/src/porcupine"
 import "fmt"
 import "sort"
 
